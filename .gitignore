@@ -1,0 +1,41 @@
+# Build artifacts
+build/
+*.app
+*.o
+*.d
+
+# Xcode
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+*.xcuserstate
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+*.egg
+venv/
+.env
+
+# ML models (large files)
+*.mlpackage/
+*.mlmodelc/
+ML/*.mlpackage
+
+# Logs
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
