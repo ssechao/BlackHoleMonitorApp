@@ -82,16 +82,29 @@ final class VocalSeparatorAI {
         process.arguments = ["python3", script]
         process.environment = ProcessInfo.processInfo.environment
         
-        // Redirect output for debugging
+        // Redirect output for debugging (use notification-based approach to avoid CPU spin)
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
         
-        pipe.fileHandleForReading.readabilityHandler = { handle in
-            if let line = String(data: handle.availableData, encoding: .utf8), !line.isEmpty {
+        // Use notification-based reading instead of readabilityHandler to avoid CPU spinning
+        let handle = pipe.fileHandleForReading
+        NotificationCenter.default.addObserver(
+            forName: .NSFileHandleDataAvailable,
+            object: handle,
+            queue: nil
+        ) { [weak handle] _ in
+            guard let handle = handle else { return }
+            let data = handle.availableData
+            if data.count > 0, let line = String(data: data, encoding: .utf8) {
                 print("[Demucs Server] \(line)", terminator: "")
             }
+            // Continue waiting for more data if process is running
+            if data.count > 0 {
+                handle.waitForDataInBackgroundAndNotify()
+            }
         }
+        handle.waitForDataInBackgroundAndNotify()
         
         do {
             try process.run()

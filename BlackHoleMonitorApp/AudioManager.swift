@@ -199,6 +199,10 @@ final class AudioManager: ObservableObject {
     @Published var spectrumBands: [Float] = Array(repeating: 0.0, count: 16)
     @Published var oscilloscopeSamples: [Float] = Array(repeating: 0.0, count: 512)
     
+    // UI update throttling (30 fps max to avoid CPU overload)
+    private var lastUIUpdateTime: CFAbsoluteTime = 0
+    private let uiUpdateInterval: CFAbsoluteTime = 1.0 / 30.0  // 30 fps
+    
     // Equalizer (8 bands, -12dB to +12dB)
     @Published var eqBands: [Float] = Array(repeating: 0.0, count: 8) {
         didSet { updateEQFilters() }
@@ -999,13 +1003,26 @@ final class AudioManager: ObservableObject {
             }
         }
         
+        // Throttle UI updates to 30 fps to avoid CPU overload
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastUIUpdateTime >= uiUpdateInterval else { return }
+        lastUIUpdateTime = now
+        
         // Update published property on main thread
+        let bandsToUpdate = spectrumDecay
         DispatchQueue.main.async { [weak self] in
-            self?.spectrumBands = self?.spectrumDecay ?? Array(repeating: 0.0, count: 16)
+            self?.spectrumBands = bandsToUpdate
         }
     }
     
+    private var lastOscilloscopeUpdateTime: CFAbsoluteTime = 0
+    
     private func updateOscilloscope(_ data: UnsafePointer<Float>, frameCount: Int) {
+        // Throttle oscilloscope updates to 30 fps (same as spectrum)
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastOscilloscopeUpdateTime >= uiUpdateInterval else { return }
+        lastOscilloscopeUpdateTime = now
+        
         let targetCount = oscilloscopeSamples.count
         guard targetCount > 0 else { return }
         
