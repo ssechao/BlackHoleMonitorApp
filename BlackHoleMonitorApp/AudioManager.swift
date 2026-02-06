@@ -197,11 +197,11 @@ final class AudioManager: ObservableObject {
     
     // Spectrum analyzer (16 bands like Alpine car stereos)
     @Published var spectrumBands: [Float] = Array(repeating: 0.0, count: 16)
-    @Published var oscilloscopeSamples: [Float] = Array(repeating: 0.0, count: 512)
+    @Published var oscilloscopeSamples: [Float] = Array(repeating: 0.0, count: 256)  // Reduced from 512
     
-    // UI update throttling (30 fps max to avoid CPU overload)
+    // UI update throttling (20 fps - sufficient for visualization, saves CPU)
     private var lastUIUpdateTime: CFAbsoluteTime = 0
-    private let uiUpdateInterval: CFAbsoluteTime = 1.0 / 30.0  // 30 fps
+    private let uiUpdateInterval: CFAbsoluteTime = 1.0 / 20.0  // 20 fps (was 30)
     
     // Equalizer (8 bands, -12dB to +12dB)
     @Published var eqBands: [Float] = Array(repeating: 0.0, count: 8) {
