@@ -24,6 +24,8 @@ struct MenuBarView: View {
             if audioManager.isRunning {
                 SpectrumContainerView(visualizationData: audioManager.visualizationData)
                     .frame(height: 70)
+                OscilloscopeContainerView(visualizationData: audioManager.visualizationData)
+                    .frame(height: 40)
             }
 
             Divider()

@@ -7,13 +7,20 @@ struct OscilloscopeView: View {
         Canvas { context, size in
             guard samples.count > 1 else { return }
             
-            // Draw background
+            // Black background
             context.fill(
                 Path(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: 6),
-                with: .color(.black.opacity(0.7))
+                with: .color(.black)
             )
             
+            // Center line (dim green grid line)
             let midY = size.height / 2
+            var centerLine = Path()
+            centerLine.move(to: CGPoint(x: 0, y: midY))
+            centerLine.addLine(to: CGPoint(x: size.width, y: midY))
+            context.stroke(centerLine, with: .color(.green.opacity(0.15)), lineWidth: 0.5)
+            
+            // Waveform
             let stepX = size.width / CGFloat(samples.count - 1)
             
             var path = Path()
@@ -25,10 +32,21 @@ struct OscilloscopeView: View {
                 path.addLine(to: CGPoint(x: x, y: y))
             }
             
-            // Simplified glow (2 passes instead of 3)
-            context.stroke(path, with: .color(.cyan.opacity(0.4)), lineWidth: 4)
-            context.stroke(path, with: .color(.white), lineWidth: 1.5)
+            // Green phosphor glow effect
+            context.stroke(path, with: .color(Color(red: 0, green: 1, blue: 0, opacity: 0.25)), lineWidth: 5)
+            context.stroke(path, with: .color(Color(red: 0, green: 1, blue: 0, opacity: 0.5)), lineWidth: 2.5)
+            context.stroke(path, with: .color(Color(red: 0.6, green: 1, blue: 0.6)), lineWidth: 1)
         }
-        .drawingGroup() // Rasterize for better performance
+        .drawingGroup()
+    }
+}
+
+/// Container that observes VisualizationData separately
+/// so oscilloscope updates don't trigger full MenuBarView re-render.
+struct OscilloscopeContainerView: View {
+    @ObservedObject var visualizationData: VisualizationData
+    
+    var body: some View {
+        OscilloscopeView(samples: visualizationData.oscilloscopeSamples)
     }
 }
