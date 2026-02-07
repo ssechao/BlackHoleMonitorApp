@@ -897,6 +897,12 @@ final class AudioManager: ObservableObject {
     
     // MARK: - Karaoke (Vocal Removal)
     
+    // Filter states for karaoke 3-band processing
+    private var karaokeLPF_L: Float = 0.0   // Bass low-pass (< 120Hz)
+    private var karaokeLPF_R: Float = 0.0
+    private var karaokeHPF_L: Float = 0.0   // Presence high-pass (> 5kHz)
+    private var karaokeHPF_R: Float = 0.0
+    
     private func applyKaraoke(_ data: UnsafeMutablePointer<Float>, frameCount: Int) {
         // Only works with stereo audio
         guard channels >= 2 else { return }
@@ -910,27 +916,75 @@ final class AudioManager: ObservableObject {
             return
         }
         
-        // Fallback: Mid-Side processing for vocal removal
-        // Vocals are typically panned center (equal in L and R)
-        // By removing the Mid (center) signal, we reduce vocals
+        // 3-band Mid-Side processing with vocal reverb removal
+        //
+        // Problem: Modern mixes spread vocals to the sides via reverb/delay/chorus.
+        // Basic Mid-Side only removes the center, leaving vocal effects on the sides.
+        //
+        // Solution: Split into 3 bands and treat each differently:
+        //   Bass    (< 120Hz) : preserve 100% (kick, bass guitar)
+        //   Vocal   (120Hz-5kHz) : remove center strongly + attenuate sides partially
+        //   Air     (> 5kHz) : light side reduction (cymbals live here too)
+        
+        let sr = inputSampleRate > 0 ? Float(inputSampleRate) : 48000.0
+        
+        // Filter coefficients (1-pole IIR)
+        let bassFreq: Float = 120.0
+        let airFreq: Float = 5000.0
+        let alphaLow = (2.0 * Float.pi * bassFreq) / (sr + 2.0 * Float.pi * bassFreq)
+        let alphaHigh = (2.0 * Float.pi * airFreq) / (sr + 2.0 * Float.pi * airFreq)
+        
+        var lpfL = karaokeLPF_L
+        var lpfR = karaokeLPF_R
+        var hpfL = karaokeHPF_L
+        var hpfR = karaokeHPF_R
+        
+        // How much to attenuate the sides in the vocal band (catches reverb/effects)
+        // 0.4 = remove 40% of the side signal in the vocal range
+        let sideReduction = intensity * 0.4
+        // Light side reduction in the air band (preserve cymbals)
+        let airSideReduction = intensity * 0.15
+        
         for frame in 0..<frameCount {
             let baseIndex = frame * channels
             let left = data[baseIndex]
             let right = data[baseIndex + 1]
             
-            // Mid = (L + R) / 2  (center content - vocals)
-            // Side = (L - R) / 2  (stereo content - instruments)
-            let mid = (left + right) * 0.5
-            let side = (left - right) * 0.5
+            // Band 1: Bass (low-pass < 120Hz) — preserved untouched
+            lpfL = alphaLow * left + (1.0 - alphaLow) * lpfL
+            lpfR = alphaLow * right + (1.0 - alphaLow) * lpfR
             
-            // Reduce mid based on intensity
-            let reducedMid = mid * (1.0 - intensity)
+            // Band 3: Air (low-pass to extract, then subtract for high-pass > 5kHz)
+            hpfL = alphaHigh * left + (1.0 - alphaHigh) * hpfL
+            hpfR = alphaHigh * right + (1.0 - alphaHigh) * hpfR
+            let airL = left - hpfL  // High-pass > 5kHz
+            let airR = right - hpfR
             
-            // Reconstruct stereo from reduced mid and full side
-            // L = Mid + Side, R = Mid - Side
-            data[baseIndex] = reducedMid + side
-            data[baseIndex + 1] = reducedMid - side
+            // Band 2: Vocal (everything between bass and air)
+            let vocalL = left - lpfL - airL
+            let vocalR = right - lpfR - airR
+            
+            // Mid-Side on vocal band (strong center + partial side removal)
+            let vocalMid = (vocalL + vocalR) * 0.5
+            let vocalSide = (vocalL - vocalR) * 0.5
+            let processedVocalMid = vocalMid * (1.0 - intensity)
+            let processedVocalSide = vocalSide * (1.0 - sideReduction)
+            
+            // Mid-Side on air band (light side reduction only)
+            let airMid = (airL + airR) * 0.5
+            let airSide = (airL - airR) * 0.5
+            let processedAirMid = airMid * (1.0 - intensity * 0.5)  // Less aggressive on air
+            let processedAirSide = airSide * (1.0 - airSideReduction)
+            
+            // Reconstruct: bass (clean) + vocal (processed) + air (lightly processed)
+            data[baseIndex]     = lpfL + (processedVocalMid + processedVocalSide) + (processedAirMid + processedAirSide)
+            data[baseIndex + 1] = lpfR + (processedVocalMid - processedVocalSide) + (processedAirMid - processedAirSide)
         }
+        
+        karaokeLPF_L = lpfL
+        karaokeLPF_R = lpfR
+        karaokeHPF_L = hpfL
+        karaokeHPF_R = hpfR
     }
     
     // Fast power approximation using exp/log approximation

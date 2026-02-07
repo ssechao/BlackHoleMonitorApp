@@ -52,9 +52,35 @@ fi
 echo -n "APPL????" > "$CONTENTS_DIR/PkgInfo"
 
 echo "Build complete: $APP_BUNDLE"
+
+# Create DMG installer with drag-and-drop to Applications
 echo ""
-echo "To install, run:"
-echo "  cp -R $APP_BUNDLE /Applications/"
+echo "Creating DMG installer..."
+
+DMG_NAME="BlackHoleMonitor"
+DMG_DIR="$BUILD_DIR/dmg"
+DMG_PATH="$BUILD_DIR/$DMG_NAME.dmg"
+
+rm -rf "$DMG_DIR" "$DMG_PATH"
+mkdir -p "$DMG_DIR"
+
+# Copy app and create Applications symlink
+cp -R "$APP_BUNDLE" "$DMG_DIR/"
+ln -s /Applications "$DMG_DIR/Applications"
+
+# Create DMG
+hdiutil create -volname "$DMG_NAME" \
+    -srcfolder "$DMG_DIR" \
+    -ov -format UDZO \
+    "$DMG_PATH" > /dev/null
+
+rm -rf "$DMG_DIR"
+
+echo "DMG created: $DMG_PATH"
 echo ""
-echo "To launch:"
+echo "To install locally:"
+echo "  sudo cp -R $APP_BUNDLE /Applications/"
 echo "  open /Applications/$APP_NAME.app"
+echo ""
+echo "To distribute:"
+echo "  Share $DMG_PATH — open it and drag the app to Applications."
