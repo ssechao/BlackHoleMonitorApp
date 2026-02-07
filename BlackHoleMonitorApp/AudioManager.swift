@@ -590,7 +590,16 @@ final class AudioManager: ObservableObject {
     }
 
     func applyVolume(_ value: Float) {
-        currentVolume = max(0.0, min(value, 1.0))
+        let clamped = max(0.0, min(value, 1.0))
+        // Apply exponential curve to match human hearing (loudness is logarithmic)
+        // Using x^3 curve: slider at 50% → gain 0.125 → -18dB (perceived as ~half volume)
+        // This feels natural: small slider movements at top = small volume changes,
+        // large slider movements at bottom = gradual fade to silence
+        if clamped <= 0 {
+            currentVolume = 0
+        } else {
+            currentVolume = clamped * clamped * clamped
+        }
     }
 
     // MARK: - Audio Processing
