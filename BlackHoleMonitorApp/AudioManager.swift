@@ -1156,11 +1156,14 @@ final class AudioManager: ObservableObject {
     }
     
     private var lastOscilloscopeUpdateTime: CFAbsoluteTime = 0
+    private let oscilloscopeUpdateInterval: CFAbsoluteTime = 1.0 / 60.0  // 60 fps for smooth waveform
+    
+    private var oscilloscopeAutoGain: Float = 4.0  // Auto-gain for oscilloscope display
     
     private func updateOscilloscope(_ data: UnsafePointer<Float>, frameCount: Int) {
-        // Throttle oscilloscope updates to 20 fps (same as spectrum)
+        // Throttle oscilloscope at 60 fps (independent from spectrum at 20 fps)
         let now = CFAbsoluteTimeGetCurrent()
-        guard now - lastOscilloscopeUpdateTime >= uiUpdateInterval else { return }
+        guard now - lastOscilloscopeUpdateTime >= oscilloscopeUpdateInterval else { return }
         lastOscilloscopeUpdateTime = now
         
         // Skip if visualization is disabled (popover closed)
@@ -1170,12 +1173,27 @@ final class AudioManager: ObservableObject {
         
         let stride = max(1, frameCount / targetCount)
         var samples = [Float](repeating: 0.0, count: targetCount)
+        var peak: Float = 0.0
         
         for i in 0..<targetCount {
             let index = min(i * stride * channels, frameCount * channels - channels)
             let left = data[index]
             let right = channels > 1 ? data[index + 1] : left
             samples[i] = (left + right) * 0.5
+            let absSample = abs(samples[i])
+            if absSample > peak { peak = absSample }
+        }
+        
+        // Auto-gain: target ~0.7 peak amplitude for visible waveform
+        // Smooth the gain to avoid jumpy display
+        let targetGain: Float = peak > 0.001 ? (0.7 / peak) : oscilloscopeAutoGain
+        let clampedGain = min(max(targetGain, 1.5), 20.0)  // Gain between 1.5x and 20x
+        oscilloscopeAutoGain = oscilloscopeAutoGain * 0.9 + clampedGain * 0.1  // Smooth
+        
+        // Apply gain and clamp
+        let gain = oscilloscopeAutoGain
+        for i in 0..<targetCount {
+            samples[i] = max(-1.0, min(1.0, samples[i] * gain))
         }
         
         let vizData = visualizationData
