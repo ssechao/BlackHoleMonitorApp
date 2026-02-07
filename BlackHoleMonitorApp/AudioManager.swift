@@ -1181,11 +1181,17 @@ final class AudioManager: ObservableObject {
             if absSample > peak { peak = absSample }
         }
         
-        // Auto-gain: target ~0.7 peak amplitude for visible waveform
-        // Smooth the gain to avoid jumpy display
-        let targetGain: Float = peak > 0.001 ? (0.7 / peak) : oscilloscopeAutoGain
-        let clampedGain = min(max(targetGain, 1.5), 20.0)  // Gain between 1.5x and 20x
-        oscilloscopeAutoGain = oscilloscopeAutoGain * 0.9 + clampedGain * 0.1  // Smooth
+        // Auto-gain: target ~0.5 peak amplitude for visible waveform without clipping
+        // Fast attack (react quickly to loud), slow release (fade up gently)
+        let targetGain: Float = peak > 0.001 ? (0.5 / peak) : oscilloscopeAutoGain
+        let clampedGain = min(max(targetGain, 1.0), 8.0)  // Gain between 1x and 8x
+        if clampedGain < oscilloscopeAutoGain {
+            // Fast attack: gain drops quickly when signal gets loud (avoid clipping)
+            oscilloscopeAutoGain = oscilloscopeAutoGain * 0.6 + clampedGain * 0.4
+        } else {
+            // Slow release: gain rises slowly when signal gets quiet
+            oscilloscopeAutoGain = oscilloscopeAutoGain * 0.95 + clampedGain * 0.05
+        }
         
         // Apply gain and clamp
         let gain = oscilloscopeAutoGain
