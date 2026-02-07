@@ -1062,7 +1062,7 @@ final class AudioManager: ObservableObject {
     // MARK: - Spectrum Analyzer
     
     private func analyzeSpectrum(_ data: UnsafePointer<Float>, frameCount: Int) {
-        guard let fftSetup = fftSetup else { return }
+        guard visualizationActive, let fftSetup = fftSetup else { return }
         
         // Mix stereo to mono and fill buffer
         let samplesToProcess = min(frameCount, spectrumBufferSize)
@@ -1144,9 +1144,6 @@ final class AudioManager: ObservableObject {
         guard now - lastUIUpdateTime >= uiUpdateInterval else { return }
         lastUIUpdateTime = now
         
-        // Skip if visualization is disabled (popover closed)
-        guard visualizationActive else { return }
-        
         // Update separate visualization object (doesn't trigger MenuBarView re-render)
         let bandsToUpdate = spectrumDecay
         let vizData = visualizationData
@@ -1161,13 +1158,13 @@ final class AudioManager: ObservableObject {
     private var oscilloscopeAutoGain: Float = 4.0  // Auto-gain for oscilloscope display
     
     private func updateOscilloscope(_ data: UnsafePointer<Float>, frameCount: Int) {
+        // Skip everything if visualization is disabled (popover closed)
+        guard visualizationActive else { return }
+        
         // Throttle oscilloscope at 60 fps (independent from spectrum at 20 fps)
         let now = CFAbsoluteTimeGetCurrent()
         guard now - lastOscilloscopeUpdateTime >= oscilloscopeUpdateInterval else { return }
         lastOscilloscopeUpdateTime = now
-        
-        // Skip if visualization is disabled (popover closed)
-        guard visualizationActive else { return }
         
         let targetCount = 256  // Fixed count matching VisualizationData
         
