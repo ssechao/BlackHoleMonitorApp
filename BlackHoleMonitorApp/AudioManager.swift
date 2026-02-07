@@ -291,6 +291,7 @@ final class AudioManager: ObservableObject {
     private var outputSampleRate: Double = 48000
     private var channels: Int = 2
     private var currentVolume: Float = 1.0
+    private var activityToken: NSObjectProtocol?  // Keeps process at high priority
     private var inputInterleaved = true
     private var outputInterleaved = true
     private var resampleRatioAdjustment: Double = 1.0  // 0.9995 à 1.0005 pour drift correction
@@ -562,6 +563,9 @@ final class AudioManager: ObservableObject {
             try check(AudioUnitInitialize(outputUnit), "AudioUnitInitialize output")
             try check(AudioOutputUnitStart(inputUnit), "AudioOutputUnitStart input")
             try check(AudioOutputUnitStart(outputUnit), "AudioOutputUnitStart output")
+            
+            // Set process to high priority for audio stability under system load
+            setRealtimePriority()
 
             isRunning = true
             saveSettings()
@@ -571,6 +575,56 @@ final class AudioManager: ObservableObject {
         }
     }
 
+    /// Set real-time priority for audio processing stability.
+    /// CoreAudio IOThreads already run at RT priority, but we also elevate
+    /// the process priority so our callbacks, GCD dispatches, and the main
+    /// thread don't get starved when the system is under heavy load (e.g. LLM inference).
+    private func setRealtimePriority() {
+        // 1. Elevate process QoS to user-interactive (highest without root)
+        let activity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .latencyCritical],
+            reason: "Real-time audio processing"
+        )
+        self.activityToken = activity
+        log("Process activity token acquired (latencyCritical)")
+        
+        // 2. Set current thread (main) to high QoS
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)
+        
+        // 3. Request real-time scheduling for audio callbacks via thread policy
+        //    CoreAudio IOThreads are already RT, but set it on our processing thread too
+        var timeConstraint = thread_time_constraint_policy_data_t(
+            period:      UInt32(inputSampleRate / 100),  // ~10ms in mach absolute time ticks
+            computation: UInt32(inputSampleRate / 200),   // ~5ms budget
+            constraint:  UInt32(inputSampleRate / 100),   // must finish within period
+            preemptible: 1                                // can be preempted
+        )
+        
+        // Get actual mach timebase for conversion
+        var timebaseInfo = mach_timebase_info_data_t()
+        mach_timebase_info(&timebaseInfo)
+        let ticksPerSecond = Double(timebaseInfo.denom) / Double(timebaseInfo.numer) * 1_000_000_000
+        
+        // Convert to mach absolute time ticks
+        let periodTicks = UInt32(ticksPerSecond * 0.01)       // 10ms
+        let computationTicks = UInt32(ticksPerSecond * 0.005)  // 5ms
+        timeConstraint.period = periodTicks
+        timeConstraint.computation = computationTicks
+        timeConstraint.constraint = periodTicks
+        
+        let result = Int32(thread_policy_set(
+            pthread_mach_thread_np(pthread_self()),
+            UInt32(THREAD_TIME_CONSTRAINT_POLICY),
+            withUnsafeMutablePointer(to: &timeConstraint) {
+                $0.withMemoryRebound(to: integer_t.self, capacity: MemoryLayout<thread_time_constraint_policy_data_t>.size / MemoryLayout<integer_t>.size) {
+                    $0
+                }
+            },
+            mach_msg_type_number_t(MemoryLayout<thread_time_constraint_policy_data_t>.size / MemoryLayout<integer_t>.size)
+        ))
+        log("Real-time thread policy: \(result == KERN_SUCCESS ? "OK" : "failed (\(result))")")
+    }
+    
     func stop() {
         if let unit = inputUnit {
             AudioOutputUnitStop(unit)
@@ -587,6 +641,12 @@ final class AudioManager: ObservableObject {
         outputUnit = nil
         resampler = nil
         isRunning = false
+        
+        // Release real-time priority
+        if let token = activityToken {
+            ProcessInfo.processInfo.endActivity(token)
+            activityToken = nil
+        }
     }
 
     func applyVolume(_ value: Float) {
