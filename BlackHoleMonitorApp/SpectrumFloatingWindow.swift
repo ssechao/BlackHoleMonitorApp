@@ -20,7 +20,7 @@ class SpectrumWindowController: NSObject, ObservableObject {
     func start() {
         guard window == nil else { return }
         
-        let size = NSSize(width: 300, height: 230)
+        let size = NSSize(width: 300, height: 280)
         let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 800, height: 600)
         let origin = NSPoint(x: screenFrame.maxX - size.width - 20, y: screenFrame.maxY - size.height - 40)
         
@@ -73,6 +73,9 @@ struct SpectrumFloatingView: View {
             VStack(spacing: 6) {
                 SpectrumAnalyzerView(bands: vizData.spectrumBands)
                     .frame(height: 50)
+                
+                OscilloscopeView(samples: vizData.oscilloscopeSamples)
+                    .frame(height: 40)
 
                 GeometryReader { geometry in
                     let sliderCount: CGFloat = 8
@@ -117,6 +120,6 @@ struct SpectrumFloatingView: View {
             .buttonStyle(.plain)
             .padding(6)
         }
-        .frame(width: 300, height: 230)
+        .frame(width: 300, height: 280)
     }
 }
