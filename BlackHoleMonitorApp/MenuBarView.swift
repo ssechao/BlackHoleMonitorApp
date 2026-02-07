@@ -19,9 +19,10 @@ struct MenuBarView: View {
             }
             .padding(.bottom, 4)
             
-            // Spectrum Analyzer (Alpine style)
+            // Spectrum Analyzer - isolated in its own observed view
+            // so updates don't trigger full MenuBarView re-render
             if audioManager.isRunning {
-                SpectrumAnalyzerView(bands: audioManager.spectrumBands)
+                SpectrumContainerView(visualizationData: audioManager.visualizationData)
                     .frame(height: 70)
             }
 

@@ -176,6 +176,15 @@ struct AudioDevice: Identifiable, Hashable {
     let isOutput: Bool
 }
 
+/// Separate ObservableObject for visualization data.
+/// This prevents spectrum/oscilloscope updates from triggering
+/// a full re-render of the entire MenuBarView (which contains
+/// pickers, sliders, toggles, etc.).
+final class VisualizationData: ObservableObject {
+    @Published var spectrumBands: [Float] = Array(repeating: 0.0, count: 16)
+    @Published var oscilloscopeSamples: [Float] = Array(repeating: 0.0, count: 256)
+}
+
 final class AudioManager: ObservableObject {
     static let shared = AudioManager()
 
@@ -195,13 +204,17 @@ final class AudioManager: ObservableObject {
     @Published var outputSampleRateDisplay: Int = 0
     @Published var sampleRateMismatch: Bool = false  // Warning when resampling is needed
     
-    // Spectrum analyzer (16 bands like Alpine car stereos)
-    @Published var spectrumBands: [Float] = Array(repeating: 0.0, count: 16)
-    @Published var oscilloscopeSamples: [Float] = Array(repeating: 0.0, count: 256)  // Reduced from 512
+    // Visualization data is in a SEPARATE ObservableObject to avoid
+    // triggering full MenuBarView re-renders on every frame update.
+    // MenuBarView observes AudioManager for controls, SpectrumView observes visualizationData.
+    let visualizationData = VisualizationData()
     
     // UI update throttling (20 fps - sufficient for visualization, saves CPU)
     private var lastUIUpdateTime: CFAbsoluteTime = 0
-    private let uiUpdateInterval: CFAbsoluteTime = 1.0 / 20.0  // 20 fps (was 30)
+    private let uiUpdateInterval: CFAbsoluteTime = 1.0 / 20.0  // 20 fps
+    
+    // Whether visualization updates are active (disabled when popover is closed)
+    var visualizationActive: Bool = true
     
     // Equalizer (8 bands, -12dB to +12dB)
     @Published var eqBands: [Float] = Array(repeating: 0.0, count: 8) {
@@ -1003,28 +1016,34 @@ final class AudioManager: ObservableObject {
             }
         }
         
-        // Throttle UI updates to 30 fps to avoid CPU overload
+        // Throttle UI updates to 20 fps to avoid CPU overload
         let now = CFAbsoluteTimeGetCurrent()
         guard now - lastUIUpdateTime >= uiUpdateInterval else { return }
         lastUIUpdateTime = now
         
-        // Update published property on main thread
+        // Skip if visualization is disabled (popover closed)
+        guard visualizationActive else { return }
+        
+        // Update separate visualization object (doesn't trigger MenuBarView re-render)
         let bandsToUpdate = spectrumDecay
-        DispatchQueue.main.async { [weak self] in
-            self?.spectrumBands = bandsToUpdate
+        let vizData = visualizationData
+        DispatchQueue.main.async {
+            vizData.spectrumBands = bandsToUpdate
         }
     }
     
     private var lastOscilloscopeUpdateTime: CFAbsoluteTime = 0
     
     private func updateOscilloscope(_ data: UnsafePointer<Float>, frameCount: Int) {
-        // Throttle oscilloscope updates to 30 fps (same as spectrum)
+        // Throttle oscilloscope updates to 20 fps (same as spectrum)
         let now = CFAbsoluteTimeGetCurrent()
         guard now - lastOscilloscopeUpdateTime >= uiUpdateInterval else { return }
         lastOscilloscopeUpdateTime = now
         
-        let targetCount = oscilloscopeSamples.count
-        guard targetCount > 0 else { return }
+        // Skip if visualization is disabled (popover closed)
+        guard visualizationActive else { return }
+        
+        let targetCount = 256  // Fixed count matching VisualizationData
         
         let stride = max(1, frameCount / targetCount)
         var samples = [Float](repeating: 0.0, count: targetCount)
@@ -1036,8 +1055,9 @@ final class AudioManager: ObservableObject {
             samples[i] = (left + right) * 0.5
         }
         
-        DispatchQueue.main.async { [weak self] in
-            self?.oscilloscopeSamples = samples
+        let vizData = visualizationData
+        DispatchQueue.main.async {
+            vizData.oscilloscopeSamples = samples
         }
     }
 

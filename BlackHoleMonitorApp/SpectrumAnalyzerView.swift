@@ -61,6 +61,17 @@ struct SpectrumAnalyzerView: View {
     }
 }
 
+/// Container view that observes VisualizationData separately
+/// from the main AudioManager, so spectrum updates don't trigger
+/// a full MenuBarView re-render.
+struct SpectrumContainerView: View {
+    @ObservedObject var visualizationData: VisualizationData
+    
+    var body: some View {
+        SpectrumAnalyzerView(bands: visualizationData.spectrumBands)
+    }
+}
+
 // Preview
 struct SpectrumAnalyzerView_Previews: PreviewProvider {
     static var previews: some View {

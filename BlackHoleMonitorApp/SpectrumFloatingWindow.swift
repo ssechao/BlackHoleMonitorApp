@@ -45,6 +45,7 @@ class SpectrumWindowController: NSObject, ObservableObject {
         
         self.window = window
         isActive = true
+        AudioManager.shared.visualizationActive = true
     }
     
     func stop() {
@@ -58,6 +59,7 @@ class SpectrumWindowController: NSObject, ObservableObject {
 
 struct SpectrumFloatingView: View {
     @ObservedObject private var audioManager = AudioManager.shared
+    @ObservedObject private var vizData = AudioManager.shared.visualizationData
     
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -69,7 +71,7 @@ struct SpectrumFloatingView: View {
                 )
             
             VStack(spacing: 6) {
-                SpectrumAnalyzerView(bands: audioManager.spectrumBands)
+                SpectrumAnalyzerView(bands: vizData.spectrumBands)
                     .frame(height: 50)
 
                 GeometryReader { geometry in

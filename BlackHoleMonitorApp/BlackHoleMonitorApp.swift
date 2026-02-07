@@ -240,6 +240,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     @objc func popoverDidClose(_ notification: Notification) {
         debugLog("Popover closed")
+        // Disable visualization updates when popover is closed to save CPU
+        // (only disable if floating spectrum window is also closed)
+        if !SpectrumWindowController.shared.isActive {
+            audioManager.visualizationActive = false
+        }
     }
 
     @objc func togglePopover() {
@@ -250,6 +255,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 popover?.performClose(nil)
             } else {
                 debugLog("Showing popover")
+                // Re-enable visualization updates when popover opens
+                audioManager.visualizationActive = true
                 NSApp.activate(ignoringOtherApps: true)
                 popover?.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
                 popover?.contentViewController?.view.window?.makeKey()

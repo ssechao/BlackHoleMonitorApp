@@ -43,12 +43,13 @@ class DiscoWindowController: NSObject, ObservableObject, NSWindowDelegate {
         window.delegate = self
         
         // Set SwiftUI content
-        let discoView = DiscoView(audioManager: AudioManager.shared)
+        let discoView = DiscoView(audioManager: AudioManager.shared, vizData: AudioManager.shared.visualizationData)
         window.contentView = NSHostingView(rootView: discoView)
         
         window.orderFront(nil)
         self.window = window
         isActive = true
+        AudioManager.shared.visualizationActive = true
     }
     
     func stop() {
@@ -72,6 +73,7 @@ class DiscoWindowController: NSObject, ObservableObject, NSWindowDelegate {
 
 struct DiscoView: View {
     @ObservedObject var audioManager: AudioManager
+    @ObservedObject var vizData: VisualizationData
     @State private var time: Double = 0
     @State private var strobeOn = false
     @State private var lastBassHit: Double = 0
@@ -322,7 +324,7 @@ struct DiscoView: View {
     // MARK: - Oscilloscope
     
     private func oscilloscopeLayer(size: CGSize) -> some View {
-        OscilloscopeView(samples: audioManager.oscilloscopeSamples)
+         OscilloscopeView(samples: vizData.oscilloscopeSamples)
             .frame(width: size.width * 0.8, height: 120)
             .position(x: size.width / 2, y: size.height * 0.75)
             .opacity(0.85)
@@ -332,14 +334,14 @@ struct DiscoView: View {
     
     private var bassLevel: Float {
         // Bands 0-3: bass (32-125Hz)
-        let bands = audioManager.spectrumBands
+        let bands = vizData.spectrumBands
         guard bands.count >= 4 else { return 0 }
         return (bands[0] + bands[1] + bands[2] + bands[3]) / 4
     }
     
     private var midLevel: Float {
         // Bands 4-11: mids (125Hz-2kHz)
-        let bands = audioManager.spectrumBands
+        let bands = vizData.spectrumBands
         guard bands.count >= 12 else { return 0 }
         var sum: Float = 0
         for i in 4..<12 { sum += bands[i] }
@@ -348,13 +350,13 @@ struct DiscoView: View {
     
     private var trebleLevel: Float {
         // Bands 12-15: treble (2-16kHz)
-        let bands = audioManager.spectrumBands
+        let bands = vizData.spectrumBands
         guard bands.count >= 16 else { return 0 }
         return (bands[12] + bands[13] + bands[14] + bands[15]) / 4
     }
     
     private var overallLevel: Float {
-        let bands = audioManager.spectrumBands
+        let bands = vizData.spectrumBands
         guard !bands.isEmpty else { return 0 }
         return bands.reduce(0, +) / Float(bands.count)
     }
