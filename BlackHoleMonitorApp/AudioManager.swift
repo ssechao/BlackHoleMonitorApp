@@ -564,8 +564,8 @@ final class AudioManager: ObservableObject {
             try check(AudioOutputUnitStart(inputUnit), "AudioOutputUnitStart input")
             try check(AudioOutputUnitStart(outputUnit), "AudioOutputUnitStart output")
             
-            // Set process to high priority for audio stability under system load
-            setRealtimePriority()
+            // Real-time priority disabled — was causing system freezes
+            // setRealtimePriority()
 
             isRunning = true
             saveSettings()
