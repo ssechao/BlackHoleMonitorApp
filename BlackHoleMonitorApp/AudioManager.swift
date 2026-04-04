@@ -214,7 +214,7 @@ final class AudioManager: ObservableObject {
     private let uiUpdateInterval: CFAbsoluteTime = 1.0 / 20.0  // 20 fps
     
     // Whether visualization updates are active (disabled when popover is closed)
-    var visualizationActive: Bool = true
+    var visualizationActive: Bool = false
     
     // Equalizer (8 bands, -12dB to +12dB)
     @Published var eqBands: [Float] = Array(repeating: 0.0, count: 8) {

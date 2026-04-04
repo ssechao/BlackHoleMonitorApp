@@ -52,6 +52,13 @@ class SpectrumWindowController: NSObject, ObservableObject {
         window?.close()
         window = nil
         isActive = false
+        disableVisualizationIfUnneeded()
+    }
+
+    private func disableVisualizationIfUnneeded() {
+        if !DiscoWindowController.shared.isActive {
+            AudioManager.shared.visualizationActive = false
+        }
     }
 }
 

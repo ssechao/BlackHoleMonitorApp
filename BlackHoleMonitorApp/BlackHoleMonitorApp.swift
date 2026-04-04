@@ -242,7 +242,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         debugLog("Popover closed")
         // Disable visualization updates when popover is closed to save CPU
         // (only disable if floating spectrum window is also closed)
-        if !SpectrumWindowController.shared.isActive {
+        if !SpectrumWindowController.shared.isActive && !DiscoWindowController.shared.isActive {
             audioManager.visualizationActive = false
         }
     }

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 // MARK: - Disco Window Controller
 
@@ -60,12 +61,20 @@ class DiscoWindowController: NSObject, ObservableObject, NSWindowDelegate {
         window.close()
         self.window = nil
         isActive = false
+        disableVisualizationIfUnneeded()
     }
-    
+
     func windowWillClose(_ notification: Notification) {
         window?.contentView = nil
         window = nil
         isActive = false
+        disableVisualizationIfUnneeded()
+    }
+
+    private func disableVisualizationIfUnneeded() {
+        if !SpectrumWindowController.shared.isActive {
+            AudioManager.shared.visualizationActive = false
+        }
     }
 }
 
@@ -78,17 +87,18 @@ struct DiscoView: View {
     @State private var strobeOn = false
     @State private var lastBassHit: Double = 0
     
-    let timer = Timer.publish(every: 1.0/60.0, on: .main, in: .common).autoconnect()
-    
+    private let timer = Timer.publish(every: 1.0/60.0, on: .main, in: .common)
+    @State private var timerCancellable: (any Cancellable)?
+
     var body: some View {
         GeometryReader { geometry in
             ZStack {
                 // Background - deep dark with subtle pulse
                 backgroundLayer(size: geometry.size)
-                
+
                 // Aurora waves
                 auroraLayer(size: geometry.size)
-                
+
                 // Laser beams
                 laserLayer(size: geometry.size)
 
@@ -112,6 +122,8 @@ struct DiscoView: View {
             time += 1.0/60.0
             updateEffects()
         }
+        .onAppear { timerCancellable = timer.connect() }
+        .onDisappear { timerCancellable?.cancel(); timerCancellable = nil }
     }
     
     // MARK: - Background
