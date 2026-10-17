@@ -5,6 +5,9 @@ import os.lock
 /// Lock-protected hand-off of visualization frames from the audio thread to the UI.
 /// The audio thread only uses `trylock` (a frame is skipped if the UI holds the lock);
 /// the UI polls with a timer instead of the audio thread dispatching blocks to main.
+///
+/// Spectrum and oscilloscope travel together as one frame, so the UI updates
+/// both in the same pass and SwiftUI renders once per frame.
 final class VisualizationTap {
     static let bandCount = 16
     static let scopeCount = 256
@@ -12,8 +15,7 @@ final class VisualizationTap {
     private let lock: UnsafeMutablePointer<os_unfair_lock>
     private let bands: UnsafeMutablePointer<Float>
     private let scope: UnsafeMutablePointer<Float>
-    private var bandsVersion: UInt64 = 0
-    private var scopeVersion: UInt64 = 0
+    private var version: UInt64 = 0
 
     init() {
         lock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
@@ -32,54 +34,42 @@ final class VisualizationTap {
     }
 
     // Audio thread
-    func publishBands(_ values: UnsafePointer<Float>) {
+    func publish(bands newBands: UnsafePointer<Float>, scope newScope: UnsafePointer<Float>) {
         guard os_unfair_lock_trylock(lock) else { return }
-        bands.update(from: values, count: Self.bandCount)
-        bandsVersion &+= 1
-        os_unfair_lock_unlock(lock)
-    }
-
-    func publishScope(_ values: UnsafePointer<Float>) {
-        guard os_unfair_lock_trylock(lock) else { return }
-        scope.update(from: values, count: Self.scopeCount)
-        scopeVersion &+= 1
+        bands.update(from: newBands, count: Self.bandCount)
+        scope.update(from: newScope, count: Self.scopeCount)
+        version &+= 1
         os_unfair_lock_unlock(lock)
     }
 
     // Main thread
-    func readBands(lastVersion: inout UInt64) -> [Float]? {
+    func readFrame(lastVersion: inout UInt64) -> (bands: [Float], scope: [Float])? {
         os_unfair_lock_lock(lock)
         defer { os_unfair_lock_unlock(lock) }
-        guard bandsVersion != lastVersion else { return nil }
-        lastVersion = bandsVersion
-        return Array(UnsafeBufferPointer(start: bands, count: Self.bandCount))
-    }
-
-    func readScope(lastVersion: inout UInt64) -> [Float]? {
-        os_unfair_lock_lock(lock)
-        defer { os_unfair_lock_unlock(lock) }
-        guard scopeVersion != lastVersion else { return nil }
-        lastVersion = scopeVersion
-        return Array(UnsafeBufferPointer(start: scope, count: Self.scopeCount))
+        guard version != lastVersion else { return nil }
+        lastVersion = version
+        return (Array(UnsafeBufferPointer(start: bands, count: Self.bandCount)),
+                Array(UnsafeBufferPointer(start: scope, count: Self.scopeCount)))
     }
 }
 
-/// Computes the 16-band spectrum (20 fps) and the oscilloscope trace (60 fps)
-/// from the output signal. Audio thread only; no allocation after `init`.
+/// Computes the 16-band spectrum and the oscilloscope trace from the output
+/// signal, `frameRate` times per second. Audio thread only; no allocation after `init`.
 ///
-/// Updates are scheduled by sample count, so the FFT runs 20 times per second
-/// whatever the hardware buffer size, always over the latest 1024 samples.
+/// Frames are scheduled by sample count, so the rate does not depend on the
+/// hardware buffer size; the FFT always covers the latest 1024 samples.
 final class AudioVisualizer {
+    /// Visualization frames per second (UI minimum: 30)
+    static let frameRate = 30.0
     static let fftSize = 1024
     private static let scopeWindow = 512  // decimated by 2 to 256 points
     private static let bandEdgesHz: [Double] = [32, 45, 63, 90, 125, 180, 250, 355, 500, 710,
                                                 1000, 1400, 2000, 4000, 8000, 12000, 16000]
-    // Bars fall to half their height per spectrum frame (20 fps)
-    private static let decayRate: Float = 0.5
+    // Bars fall to half their height in 50 ms, as before at 20 fps (0.5^(20/30) per frame)
+    private static let decayRate: Float = 0.63
 
     private let tap: VisualizationTap
-    private let spectrumInterval: Int
-    private let scopeInterval: Int
+    private let frameInterval: Int
 
     private let fftSetup: vDSP_DFT_Setup
     private let history: UnsafeMutablePointer<Float>  // mono, circular, fftSize
@@ -94,8 +84,7 @@ final class AudioVisualizer {
     private let scope: UnsafeMutablePointer<Float>
     private let binRanges: [(start: Int, end: Int)]  // read-only after init
 
-    private var samplesSinceSpectrum = 0
-    private var samplesSinceScope = 0
+    private var samplesSinceFrame = 0
     private var scopeAutoGain: Float = 4.0
 
     init?(sampleRate: Double, tap: VisualizationTap) {
@@ -103,8 +92,7 @@ final class AudioVisualizer {
         guard let setup = vDSP_DFT_zop_CreateSetup(nil, vDSP_Length(n), .FORWARD) else { return nil }
         fftSetup = setup
         self.tap = tap
-        spectrumInterval = max(1, Int(sampleRate / 20))
-        scopeInterval = max(1, Int(sampleRate / 60))
+        frameInterval = max(1, Int(sampleRate / Self.frameRate))
 
         func buffer(_ count: Int) -> UnsafeMutablePointer<Float> {
             let p = UnsafeMutablePointer<Float>.allocate(capacity: count)
@@ -156,15 +144,14 @@ final class AudioVisualizer {
             historyIndex = (historyIndex + 1) & (n - 1)
         }
 
-        samplesSinceSpectrum += frameCount
-        if samplesSinceSpectrum >= spectrumInterval {
-            samplesSinceSpectrum = 0
+        samplesSinceFrame += frameCount
+        if samplesSinceFrame >= frameInterval {
+            // Keep the remainder so the average rate is exact; at most one frame
+            // per buffer (buffers longer than a frame period cap the rate).
+            samplesSinceFrame = min(samplesSinceFrame - frameInterval, frameInterval - 1)
             computeSpectrum()
-        }
-        samplesSinceScope += frameCount
-        if samplesSinceScope >= scopeInterval {
-            samplesSinceScope = 0
             computeScope()
+            tap.publish(bands: bands, scope: scope)
         }
     }
 
@@ -190,7 +177,6 @@ final class AudioVisualizer {
             let level = max(0.0, min(1.0, (db + 14.0) / 60.0))
             bands[band] = level > bands[band] ? level : bands[band] * Self.decayRate
         }
-        tap.publishBands(bands)
     }
 
     private func computeScope() {
@@ -216,6 +202,5 @@ final class AudioVisualizer {
         vDSP_vsmul(scope, 1, &gain, scope, 1, vDSP_Length(count))
         var lo: Float = -1, hi: Float = 1
         vDSP_vclip(scope, 1, &lo, &hi, scope, 1, vDSP_Length(count))
-        tap.publishScope(scope)
     }
 }

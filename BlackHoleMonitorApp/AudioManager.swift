@@ -17,13 +17,31 @@ private func deviceChangeCallback(
     return noErr
 }
 
-/// Separate ObservableObject for visualization data.
-/// This prevents spectrum/oscilloscope updates from triggering
-/// a full re-render of the entire MenuBarView (which contains
-/// pickers, sliders, toggles, etc.).
+/// Receives visualization frames on the main thread, outside of SwiftUI.
+protocol VisualizationListener: AnyObject {
+    func visualizationFrame(bands: [Float], scope: [Float])
+}
+
+/// Latest visualization frame, delivered two ways:
+/// - directly to registered `VisualizationListener`s (Core Animation views of the
+///   popover and floating window): no SwiftUI update per frame;
+/// - through `@Published` for SwiftUI views that animate anyway (disco mode).
 final class VisualizationData: ObservableObject {
-    @Published var spectrumBands: [Float] = Array(repeating: 0.0, count: VisualizationTap.bandCount)
-    @Published var oscilloscopeSamples: [Float] = Array(repeating: 0.0, count: VisualizationTap.scopeCount)
+    @Published private(set) var spectrumBands: [Float] = Array(repeating: 0.0, count: VisualizationTap.bandCount)
+    @Published private(set) var oscilloscopeSamples: [Float] = Array(repeating: 0.0, count: VisualizationTap.scopeCount)
+    private let listeners = NSHashTable<AnyObject>.weakObjects()
+
+    func addListener(_ listener: VisualizationListener) {
+        listeners.add(listener)
+    }
+
+    func deliver(bands: [Float], scope: [Float]) {
+        for case let listener as VisualizationListener in listeners.allObjects {
+            listener.visualizationFrame(bands: bands, scope: scope)
+        }
+        spectrumBands = bands
+        oscilloscopeSamples = scope
+    }
 }
 
 /// Settings, device management and session lifecycle. Main thread only.
@@ -56,8 +74,7 @@ final class AudioManager: ObservableObject {
     let visualizationData = VisualizationData()
     private let visualizationTap = VisualizationTap()
     private var visualizationTimer: Timer?
-    private var bandsVersion: UInt64 = 0
-    private var scopeVersion: UInt64 = 0
+    private var visualizationVersion: UInt64 = 0
 
     /// Whether visualization is computed (any visualization UI visible)
     var visualizationActive: Bool = false {
@@ -322,10 +339,12 @@ final class AudioManager: ObservableObject {
     // MARK: - Visualization polling
 
     /// Pulls frames published by the audio thread, only while something is visible.
+    /// Polls at twice the frame rate so a frame is never shown late by a whole
+    /// period; views are only invalidated when a new frame arrived.
     private func updateVisualizationTimer() {
         let shouldRun = visualizationActive && isRunning
         if shouldRun, visualizationTimer == nil {
-            let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            let timer = Timer(timeInterval: 0.5 / AudioVisualizer.frameRate, repeats: true) { [weak self] _ in
                 self?.pollVisualization()
             }
             RunLoop.main.add(timer, forMode: .common)
@@ -337,12 +356,8 @@ final class AudioManager: ObservableObject {
     }
 
     private func pollVisualization() {
-        if let bands = visualizationTap.readBands(lastVersion: &bandsVersion) {
-            visualizationData.spectrumBands = bands
-        }
-        if let scope = visualizationTap.readScope(lastVersion: &scopeVersion) {
-            visualizationData.oscilloscopeSamples = scope
-        }
+        guard let frame = visualizationTap.readFrame(lastVersion: &visualizationVersion) else { return }
+        visualizationData.deliver(bands: frame.bands, scope: frame.scope)
     }
 
     // MARK: - Settings Persistence

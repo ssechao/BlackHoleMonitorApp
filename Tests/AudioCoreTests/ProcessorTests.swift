@@ -185,13 +185,31 @@ final class AudioVisualizerTests: XCTestCase {
         let data = TestSignals.sine(frequency: 1200, sampleRate: 48000, frames: 48000 / 10, amplitude: 0.5)
         data.withUnsafeBufferPointer { visualizer.process($0.baseAddress!, frameCount: 4800, channels: 2) }
         var version: UInt64 = 0
-        let bands = try XCTUnwrap(tap.readBands(lastVersion: &version))
+        let frame = try XCTUnwrap(tap.readFrame(lastVersion: &version))
         // Band 10 covers 1.0-1.4 kHz
-        XCTAssertEqual(bands.firstIndex(of: bands.max()!), 10)
-        XCTAssertNil(tap.readBands(lastVersion: &version), "No new frame without new audio")
-        var scopeVersion: UInt64 = 0
-        let scope = try XCTUnwrap(tap.readScope(lastVersion: &scopeVersion))
-        XCTAssertEqual(scope.count, VisualizationTap.scopeCount)
-        XCTAssertTrue(scope.allSatisfy { abs($0) <= 1 })
+        XCTAssertEqual(frame.bands.firstIndex(of: frame.bands.max()!), 10)
+        XCTAssertEqual(frame.scope.count, VisualizationTap.scopeCount)
+        XCTAssertTrue(frame.scope.allSatisfy { abs($0) <= 1 })
+        XCTAssertNil(tap.readFrame(lastVersion: &version), "No new frame without new audio")
+    }
+
+    func testFrameRateIsIndependentOfBufferSize() throws {
+        let tap = VisualizationTap()
+        let visualizer = try XCTUnwrap(AudioVisualizer(sampleRate: 48000, tap: tap))
+        let data = [Float](repeating: 0.1, count: 2048 * 2)
+        var version: UInt64 = 0
+        var frames = 0
+        for blockSize in [64, 512, 2048] {
+            frames = 0
+            var processed = 0
+            while processed < 48000 {  // one second
+                data.withUnsafeBufferPointer { visualizer.process($0.baseAddress!, frameCount: blockSize, channels: 2) }
+                processed += blockSize
+                if tap.readFrame(lastVersion: &version) != nil { frames += 1 }
+            }
+            // At most one frame per hardware buffer
+            let expected = min(AudioVisualizer.frameRate, 48000 / Double(blockSize))
+            XCTAssertEqual(Double(frames), expected, accuracy: 1.5, "block size \(blockSize)")
+        }
     }
 }

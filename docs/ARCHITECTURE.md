@@ -48,7 +48,7 @@ Les FIFO (`RingBuffer`) sont préallouées et protégées par `os_unfair_lock`. 
 | `Compressor.swift` | Compresseur crête par blocs de 32 frames |
 | `Equalizer.swift` | 8 biquads (RBJ, Q = 1) en SIMD8, contournement quand tout est à 0 dB |
 | `MidSideKaraoke.swift` | Karaoké instantané, Mid-Side sur 3 bandes |
-| `AudioVisualizer.swift` | FFT 1024 points (20 i/s) et oscilloscope (60 i/s), `VisualizationTap` |
+| `AudioVisualizer.swift` | FFT 1024 points et oscilloscope, 30 i/s synchronisés, `VisualizationTap` |
 | `DemucsProtocol.swift` | Format des messages client/serveur (v2) |
 | `DemucsBridge.swift` | FIFO entrée/sortie du karaoké IA, mélange sec/traité aligné |
 
@@ -62,7 +62,8 @@ Les FIFO (`RingBuffer`) sont préallouées et protégées par `os_unfair_lock`. 
 | `AudioDevices.swift` | Requêtes CoreAudio (noms, canaux, fréquences) partagées |
 | `Log.swift` | Journalisation unifiée (`os.Logger`) |
 | `BlackHoleMonitorApp.swift` | `AppDelegate`, popover, écouteurs de volume/muet de Background Music |
-| `MenuBarView.swift`, `*View.swift`, `*Window.swift` | Interface |
+| `SpectrumAnalyzerView.swift`, `OscilloscopeView.swift` | Visualisations Core Animation (`*LayerView`) et wrappers SwiftUI ; `OscilloscopeView` (Canvas) pour le disco |
+| `MenuBarView.swift`, `DiscoView.swift`, `*Window.swift` | Interface |
 
 ## Pipeline audio
 
@@ -101,9 +102,18 @@ thread audio <-(DemucsBridge.fromServer)- file réseau <-RESULT-- (traité + sec
 
 ## Système de visualisation
 
-- Le thread audio calcule le spectre et l'oscilloscope **à partir du nombre d'échantillons**, quelle que soit la taille des buffers, puis les dépose dans `VisualizationTap` (`trylock`).
-- Une minuterie du thread principal (60 Hz) les copie dans `VisualizationData`. Elle ne tourne que si une visualisation est visible **et** que l'audio est démarré.
-- Les vues observent seulement `VisualizationData`. `DiscoView` n'observe plus `AudioManager`.
+- Le thread audio calcule le spectre et l'oscilloscope ensemble, 30 fois par seconde **à partir du nombre d'échantillons** (indépendamment de la taille des buffers), et les dépose dans `VisualizationTap` (`trylock`).
+- Une minuterie du thread principal (60 Hz, pour ne jamais afficher une image en retard d'une période) lit la dernière image et la transmet par `VisualizationData.deliver`. Elle ne tourne que si une visualisation est visible **et** que l'audio est démarré.
+- **Popover et fenêtre flottante** : `SpectrumLayerView` et `OscilloscopeLayerView` sont des `NSView` en Core Animation, enregistrées comme `VisualizationListener`. Le spectre est une grille de segments statique avec un masque de 16 barres, dont seules les hauteurs changent à chaque image. L'oscilloscope est un tracé de 256 points partagé par 3 `CAShapeLayer`. SwiftUI n'est pas sollicité à chaque image, et la rastérisation se fait dans le serveur de rendu.
+- **Mode disco** : il reste en SwiftUI (`Canvas`, animation à 60 i/s de toute façon) et observe les valeurs `@Published` de `VisualizationData`.
+
+### Mesures (CPU de l'app, BlackHole -> sortie USB à 48 kHz, Mac mini Apple Silicon)
+
+| État | CPU |
+|---|---|
+| Popover ouvert, Canvas SwiftUI (versions précédentes) | ~15 % |
+| Popover ouvert, Core Animation (actuel) | 2,5 % (3 relevés de 60 s : 2,48 / 2,55 / 2,55) |
+| Popover fermé, routage audio actif | 0,5 % |
 
 ### Gestion du drapeau `visualizationActive`
 
@@ -145,6 +155,7 @@ Le projet est passé de **182 % CPU** à **0,0 % au repos** en plusieurs étapes
 3. **FFT ignorée quand rien n'est visible** (`1d5142f`)
 4. **Désactivation complète au repos** (`8ec583b`)
 5. **Callbacks sans allocation** : FFT calculée 20 fois par seconde (et non plus à chaque callback), serveur Demucs lancé seulement à la demande (il démarrait avant à chaque lancement de l'app)
+6. **Visualisation en Core Animation** : une image synchronisée à 30 i/s, dessinée par des `CALayer` au lieu de `Canvas` SwiftUI (~15 % -> 2,5 % avec le popover ouvert)
 
 ### Note sur le sample rate
 
