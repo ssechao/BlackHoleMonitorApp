@@ -66,7 +66,6 @@ class SpectrumWindowController: NSObject, ObservableObject {
 
 struct SpectrumFloatingView: View {
     @ObservedObject private var audioManager = AudioManager.shared
-    @ObservedObject private var vizData = AudioManager.shared.visualizationData
     
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -78,10 +77,10 @@ struct SpectrumFloatingView: View {
                 )
             
             VStack(spacing: 6) {
-                SpectrumAnalyzerView(bands: vizData.spectrumBands)
+                SpectrumContainerView(visualizationData: audioManager.visualizationData)
                     .frame(height: 50)
-                
-                OscilloscopeView(samples: vizData.oscilloscopeSamples)
+
+                OscilloscopeContainerView(visualizationData: audioManager.visualizationData)
                     .frame(height: 40)
 
                 GeometryReader { geometry in

@@ -17,13 +17,31 @@ private func deviceChangeCallback(
     return noErr
 }
 
-/// Separate ObservableObject for visualization data.
-/// This prevents spectrum/oscilloscope updates from triggering
-/// a full re-render of the entire MenuBarView (which contains
-/// pickers, sliders, toggles, etc.).
+/// Receives visualization frames on the main thread, outside of SwiftUI.
+protocol VisualizationListener: AnyObject {
+    func visualizationFrame(bands: [Float], scope: [Float])
+}
+
+/// Latest visualization frame, delivered two ways:
+/// - directly to registered `VisualizationListener`s (Core Animation views of the
+///   popover and floating window): no SwiftUI update per frame;
+/// - through `@Published` for SwiftUI views that animate anyway (disco mode).
 final class VisualizationData: ObservableObject {
-    @Published var spectrumBands: [Float] = Array(repeating: 0.0, count: VisualizationTap.bandCount)
-    @Published var oscilloscopeSamples: [Float] = Array(repeating: 0.0, count: VisualizationTap.scopeCount)
+    @Published private(set) var spectrumBands: [Float] = Array(repeating: 0.0, count: VisualizationTap.bandCount)
+    @Published private(set) var oscilloscopeSamples: [Float] = Array(repeating: 0.0, count: VisualizationTap.scopeCount)
+    private let listeners = NSHashTable<AnyObject>.weakObjects()
+
+    func addListener(_ listener: VisualizationListener) {
+        listeners.add(listener)
+    }
+
+    func deliver(bands: [Float], scope: [Float]) {
+        for case let listener as VisualizationListener in listeners.allObjects {
+            listener.visualizationFrame(bands: bands, scope: scope)
+        }
+        spectrumBands = bands
+        oscilloscopeSamples = scope
+    }
 }
 
 /// Settings, device management and session lifecycle. Main thread only.
@@ -339,9 +357,7 @@ final class AudioManager: ObservableObject {
 
     private func pollVisualization() {
         guard let frame = visualizationTap.readFrame(lastVersion: &visualizationVersion) else { return }
-        // Both in the same run loop pass: a single SwiftUI update per frame
-        visualizationData.spectrumBands = frame.bands
-        visualizationData.oscilloscopeSamples = frame.scope
+        visualizationData.deliver(bands: frame.bands, scope: frame.scope)
     }
 
     // MARK: - Settings Persistence
