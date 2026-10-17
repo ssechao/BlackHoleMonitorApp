@@ -39,3 +39,7 @@ ML/*.mlpackage
 .vscode/
 *.swp
 *.swo
+
+# SwiftPM
+.build/
+.swiftpm/

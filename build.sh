@@ -13,31 +13,26 @@ rm -rf "$BUILD_DIR"
 mkdir -p "$MACOS_DIR"
 mkdir -p "$RESOURCES_DIR"
 
-# Compile CoreML model if exists
-if [ -d "BlackHoleMonitorApp/VocalSeparatorMicro.mlpackage" ]; then
-    echo "Compiling CoreML model..."
-    xcrun coremlcompiler compile BlackHoleMonitorApp/VocalSeparatorMicro.mlpackage "$RESOURCES_DIR"
-fi
+# Architectures: ARCHS="arm64 x86_64" ./build.sh for a universal binary
+ARCHS="${ARCHS:-arm64}"
+SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)"
+SOURCES=(BlackHoleMonitorApp/*.swift BlackHoleMonitorApp/DSP/*.swift)
 
-# Compile
-echo "Compiling..."
-swiftc -o "$MACOS_DIR/$APP_NAME" \
-    -target arm64-apple-macosx13.0 \
-    -sdk /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk \
-    -parse-as-library \
-    -O \
-    BlackHoleMonitorApp/BlackHoleMonitorApp.swift \
-    BlackHoleMonitorApp/MenuBarView.swift \
-    BlackHoleMonitorApp/AudioManager.swift \
-    BlackHoleMonitorApp/SpectrumAnalyzerView.swift \
-    BlackHoleMonitorApp/OscilloscopeView.swift \
-    BlackHoleMonitorApp/VerticalSliderView.swift \
-    BlackHoleMonitorApp/DiscoView.swift \
-    BlackHoleMonitorApp/SpectrumFloatingWindow.swift \
-    BlackHoleMonitorApp/VocalSeparatorAI.swift \
-    BlackHoleMonitorApp/OptimizedAudioProcessing.swift \
-    BlackHoleMonitorApp/DriftCorrectionTests.swift \
-    -Xlinker -rpath -Xlinker @executable_path/../Frameworks
+echo "Compiling (${ARCHS})..."
+BINARIES=()
+for ARCH in $ARCHS; do
+    OUT="$BUILD_DIR/$APP_NAME-$ARCH"
+    swiftc -o "$OUT" \
+        -target "$ARCH-apple-macosx13.0" \
+        -sdk "$SDK_PATH" \
+        -parse-as-library \
+        -O -wmo \
+        "${SOURCES[@]}" \
+        -Xlinker -rpath -Xlinker @executable_path/../Frameworks
+    BINARIES+=("$OUT")
+done
+lipo -create "${BINARIES[@]}" -output "$MACOS_DIR/$APP_NAME"
+rm -f "${BINARIES[@]}"
 
 # Copy Info.plist
 cp BlackHoleMonitorApp/Info.plist "$CONTENTS_DIR/"

@@ -44,7 +44,7 @@ class DiscoWindowController: NSObject, ObservableObject, NSWindowDelegate {
         window.delegate = self
         
         // Set SwiftUI content
-        let discoView = DiscoView(audioManager: AudioManager.shared, vizData: AudioManager.shared.visualizationData)
+        let discoView = DiscoView(vizData: AudioManager.shared.visualizationData)
         window.contentView = NSHostingView(rootView: discoView)
         
         window.orderFront(nil)
@@ -81,7 +81,6 @@ class DiscoWindowController: NSObject, ObservableObject, NSWindowDelegate {
 // MARK: - Disco View (60fps animated)
 
 struct DiscoView: View {
-    @ObservedObject var audioManager: AudioManager
     @ObservedObject var vizData: VisualizationData
     @State private var time: Double = 0
     @State private var strobeOn = false

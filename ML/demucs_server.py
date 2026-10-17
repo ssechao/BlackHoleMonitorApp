@@ -1,309 +1,292 @@
 #!/usr/bin/env python3
 """
-Demucs Real-time Server for BlackHoleMonitorApp
-Provides high-quality vocal separation with ~3s latency
+Demucs real-time vocal separation server for BlackHoleMonitorApp.
+
+Protocol v2 (see BlackHoleMonitorApp/DSP/DemucsProtocol.swift). Every message
+starts with a 12-byte little-endian header: magic "BHMD", type, value.
+
+    HELLO      app -> server  value = sample rate          no payload
+    HELLO_ACK  server -> app  value = protocol version     no payload
+    AUDIO      app -> server  value = frames   payload = frames x [L, R] float32
+    RESULT     server -> app  value = frames   payload = frames x [wetL, wetR, dryL, dryR]
+
+Streaming: each step separates [CONTEXT_S of previous input | HOP_S of new input]
+and emits HOP_S of output, cross-fading XFADE_S at chunk boundaries.
+Latency is about HOP_S + XFADE_S + processing time.
+
+Usage: demucs_server.py [--port 19845] [--parent-pid PID]
 """
 
+import argparse
+import os
 import socket
 import struct
-import threading
-import numpy as np
-from collections import deque
-import time
-import os
 import sys
+import threading
+import time
 
-# Fix SSL certificate issue on macOS
-import ssl
-ssl._create_default_https_context = ssl._create_unverified_context
+import numpy as np
 
-# Add user site-packages to path
-sys.path.insert(0, os.path.expanduser('~/Library/Python/3.13/lib/python3.13/site-packages'))
+# Interpreters launched from a GUI app may not see the user site-packages of
+# the version demucs was installed for; add it generically (no hardcoded version).
+_user_site = os.path.expanduser(
+    f"~/Library/Python/{sys.version_info.major}.{sys.version_info.minor}"
+    f"/lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages")
+if os.path.isdir(_user_site) and _user_site not in sys.path:
+    sys.path.append(_user_site)
 
-import torch
-import torchaudio
-from demucs import pretrained
-from demucs.apply import apply_model
+# python.org builds ship without root certificates: use certifi's bundle for the
+# model download instead of disabling TLS verification.
+try:
+    import certifi
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+except ImportError:
+    pass
 
-# Server configuration
-HOST = '127.0.0.1'
-PORT = 19845
-SAMPLE_RATE = 44100
+import torch  # noqa: E402
+import torchaudio.functional as AF  # noqa: E402
+from demucs import pretrained  # noqa: E402
+from demucs.apply import apply_model  # noqa: E402
+
+MAGIC = 0x444D4842  # "BHMD"
+PROTOCOL_VERSION = 2
+HEADER = struct.Struct("<III")
+MSG_HELLO, MSG_HELLO_ACK, MSG_AUDIO, MSG_RESULT = 1, 2, 3, 4
+MAX_FRAMES_PER_MESSAGE = 2_000_000
+
 CHANNELS = 2
-CHUNK_DURATION = 3.0  # seconds to buffer before processing
-OVERLAP = 0.5  # overlap between chunks for smooth transitions
+CONTEXT_S = 1.0     # left context given to the model (not emitted)
+HOP_S = 1.5         # new audio emitted per step
+XFADE_S = 0.2       # cross-fade between consecutive steps (<= CONTEXT_S)
+MAX_BACKLOG_S = 10.0  # drop oldest input if processing falls behind
 
-class DemucsServer:
+
+def log(message):
+    print(f"[Demucs] {message}", flush=True)
+
+
+def recv_exact(conn, size):
+    chunks = []
+    remaining = size
+    while remaining > 0:
+        chunk = conn.recv(min(remaining, 1 << 16))
+        if not chunk:
+            raise ConnectionError("client closed the connection")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def send_message(conn, msg_type, value, payload=b""):
+    conn.sendall(HEADER.pack(MAGIC, msg_type, value) + payload)
+
+
+class Separator:
+    """Loads the model once; separate() returns the instrumental part."""
+
     def __init__(self):
+        self.device = "mps" if torch.backends.mps.is_available() else "cpu"
         self.model = None
-        self.device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-        self.input_buffer = deque()
-        self.output_buffer = deque()
-        self.buffer_lock = threading.Lock()
-        self.running = False
-        self.processing_thread = None
-        
-        # Buffer sizes in samples
-        self.chunk_samples = int(CHUNK_DURATION * SAMPLE_RATE)
-        self.overlap_samples = int(OVERLAP * SAMPLE_RATE)
-        self.hop_samples = self.chunk_samples - self.overlap_samples
-        
-        # Crossfade window for overlap-add
-        self.fade_in = np.linspace(0, 1, self.overlap_samples).astype(np.float32)
-        self.fade_out = np.linspace(1, 0, self.overlap_samples).astype(np.float32)
-        
-        # Previous overlap for crossfade
-        self.prev_overlap = None
-        
-        print(f"[Demucs] Device: {self.device}")
-        print(f"[Demucs] Chunk: {CHUNK_DURATION}s ({self.chunk_samples} samples)")
-        print(f"[Demucs] Overlap: {OVERLAP}s ({self.overlap_samples} samples)")
-        
-    def load_model(self):
-        """Load Demucs model"""
-        print("[Demucs] Loading model (htdemucs)...")
-        try:
-            self.model = pretrained.get_model('htdemucs')
-            self.model.to(self.device)
-            self.model.eval()
-            print("[Demucs] Model loaded successfully!")
-            return True
-        except Exception as e:
-            print(f"[Demucs] Failed to load model: {e}")
-            # Try smaller model
+
+    def load(self):
+        for name in ("htdemucs", "htdemucs_ft"):
             try:
-                print("[Demucs] Trying htdemucs_ft...")
-                self.model = pretrained.get_model('htdemucs_ft')
-                self.model.to(self.device)
-                self.model.eval()
-                print("[Demucs] Model htdemucs_ft loaded!")
+                log(f"Loading model {name} on {self.device}...")
+                model = pretrained.get_model(name)
+                model.to(self.device)
+                model.eval()
+                self.model = model
+                log(f"Model {name} loaded")
                 return True
-            except Exception as e2:
-                print(f"[Demucs] Failed to load any model: {e2}")
-                return False
-    
-    def process_audio(self, audio):
-        """
-        Process audio through Demucs to remove vocals
-        audio: numpy array (samples, 2) - stereo interleaved
-        returns: numpy array (samples, 2) - instrumentals only
-        """
-        if self.model is None:
-            return audio
-            
+            except Exception as error:  # noqa: BLE001 - try the next model
+                log(f"Failed to load {name}: {error}")
+        return False
+
+    def separate(self, audio, sample_rate):
+        """audio: (frames, 2) float32 at sample_rate -> instrumental (frames, 2)."""
+        frames = audio.shape[0]
+        waveform = torch.from_numpy(np.ascontiguousarray(audio.T)).float().unsqueeze(0)
+        model_rate = self.model.samplerate
+        if sample_rate != model_rate:
+            waveform = AF.resample(waveform, sample_rate, model_rate)
+        with torch.no_grad():
+            sources = apply_model(self.model, waveform.to(self.device), device=self.device)
+        vocals = self.model.sources.index("vocals")
+        instrumental = sources[0].sum(dim=0) - sources[0, vocals]
+        instrumental = instrumental.unsqueeze(0).cpu()
+        if sample_rate != model_rate:
+            instrumental = AF.resample(instrumental, model_rate, sample_rate)
+        result = instrumental[0].numpy().T
+        # Resampling may be off by a frame: pad/trim to the input length
+        if result.shape[0] < frames:
+            result = np.vstack([result, np.zeros((frames - result.shape[0], CHANNELS), np.float32)])
+        return np.ascontiguousarray(result[:frames], dtype=np.float32)
+
+
+class Stream:
+    """Per-connection streaming state (reset by every HELLO)."""
+
+    def __init__(self, sample_rate):
+        self.sample_rate = sample_rate
+        self.context = int(CONTEXT_S * sample_rate)
+        self.hop = int(HOP_S * sample_rate)
+        self.xfade = min(int(XFADE_S * sample_rate), self.context)
+        self.max_backlog = int(MAX_BACKLOG_S * sample_rate)
+        self.pending = []           # list of (n, 2) arrays not yet processed
+        self.pending_frames = 0
+        self.history = np.zeros((self.context, CHANNELS), np.float32)
+        self.held_wet = np.zeros((self.xfade, CHANNELS), np.float32)
+        ramp = np.linspace(0.0, 1.0, self.xfade, dtype=np.float32)[:, None]
+        self.fade_in, self.fade_out = ramp, 1.0 - ramp
+
+    def push(self, samples):
+        self.pending.append(samples)
+        self.pending_frames += samples.shape[0]
+        if self.pending_frames > self.max_backlog:
+            merged = np.concatenate(self.pending)[-self.max_backlog:]
+            log(f"Processing too slow, dropped {self.pending_frames - merged.shape[0]} frames")
+            self.pending, self.pending_frames = [merged], merged.shape[0]
+
+    def take_hop(self):
+        if self.pending_frames < self.hop:
+            return None
+        merged = np.concatenate(self.pending)
+        hop, rest = merged[:self.hop], merged[self.hop:]
+        self.pending, self.pending_frames = ([rest] if rest.size else []), rest.shape[0]
+        return hop
+
+    def step(self, separator, hop):
+        """Separates one hop and returns RESULT frames (hop, 4)."""
+        window = np.vstack([self.history, hop])
+        wet = separator.separate(window, self.sample_rate)
+        self.history = window[-self.context:]
+
+        c, x, h = self.context, self.xfade, self.hop
+        # Output covers input positions [start - x, start + hop - x)
+        out_wet = np.empty((h, CHANNELS), np.float32)
+        out_wet[:x] = self.held_wet * self.fade_out + wet[c - x:c] * self.fade_in
+        out_wet[x:] = wet[c:c + h - x]
+        self.held_wet = wet[c + h - x:c + h].copy()
+        out_dry = window[c - x:c + h - x]
+        return np.ascontiguousarray(np.hstack([out_wet, out_dry]), dtype=np.float32)
+
+
+class Connection:
+    def __init__(self, conn, separator):
+        self.conn = conn
+        self.separator = separator
+        self.lock = threading.Condition()
+        self.stream = None
+        self.closed = False
+
+    def serve(self):
+        worker = threading.Thread(target=self.process_loop, daemon=True)
+        worker.start()
         try:
-            # Convert to torch tensor (channels, samples)
-            waveform = torch.from_numpy(audio.T).float().unsqueeze(0)  # (1, 2, samples)
-            
-            # Ensure correct sample rate
-            if SAMPLE_RATE != self.model.samplerate:
-                waveform = torchaudio.transforms.Resample(
-                    SAMPLE_RATE, self.model.samplerate
-                )(waveform)
-            
-            waveform = waveform.to(self.device)
-            
-            # Apply model
-            with torch.no_grad():
-                sources = apply_model(self.model, waveform, device=self.device)
-            
-            # sources shape: (1, num_sources, 2, samples)
-            # htdemucs sources: drums, bass, other, vocals
-            # We want everything except vocals (index 3)
-            
-            # Sum all sources except vocals
-            instrumental = sources[0, 0] + sources[0, 1] + sources[0, 2]  # drums + bass + other
-            
-            # Resample back if needed
-            if SAMPLE_RATE != self.model.samplerate:
-                instrumental = torchaudio.transforms.Resample(
-                    self.model.samplerate, SAMPLE_RATE
-                )(instrumental.unsqueeze(0)).squeeze(0)
-            
-            # Convert back to numpy (samples, 2)
-            result = instrumental.cpu().numpy().T
-            
-            return result.astype(np.float32)
-            
-        except Exception as e:
-            print(f"[Demucs] Processing error: {e}")
-            return audio
-    
-    def processing_loop(self):
-        """Background thread for processing audio"""
-        print("[Demucs] Processing thread started")
-        
-        while self.running:
-            # Check if we have enough samples to process
-            with self.buffer_lock:
-                buffer_samples = len(self.input_buffer)
-            
-            if buffer_samples >= self.chunk_samples:
-                # Extract chunk for processing
-                with self.buffer_lock:
-                    chunk = np.array([self.input_buffer.popleft() 
-                                     for _ in range(self.hop_samples)])
-                    # Keep overlap in buffer for next chunk
-                
-                start_time = time.time()
-                
-                # Reconstruct full chunk with overlap from previous
-                if self.prev_overlap is not None:
-                    full_chunk = np.vstack([self.prev_overlap, chunk])
+            while True:
+                magic, msg_type, value = HEADER.unpack(recv_exact(self.conn, HEADER.size))
+                if magic != MAGIC:
+                    raise ValueError(f"bad magic 0x{magic:08x} (protocol mismatch)")
+                if msg_type == MSG_HELLO:
+                    # Sends happen under the lock, so no stale RESULT can follow the ACK
+                    with self.lock:
+                        self.stream = Stream(int(value))
+                        send_message(self.conn, MSG_HELLO_ACK, PROTOCOL_VERSION)
+                    log(f"Stream configured at {value} Hz")
+                elif msg_type == MSG_AUDIO:
+                    if value > MAX_FRAMES_PER_MESSAGE:
+                        raise ValueError(f"audio message too large: {value} frames")
+                    payload = recv_exact(self.conn, value * CHANNELS * 4)
+                    samples = np.frombuffer(payload, dtype="<f4").reshape(-1, CHANNELS)
+                    with self.lock:
+                        if self.stream is not None:
+                            self.stream.push(samples)
+                            self.lock.notify()
                 else:
-                    # First chunk - pad with zeros
-                    full_chunk = np.vstack([np.zeros((self.overlap_samples, CHANNELS), dtype=np.float32), chunk])
-                
-                # Process through Demucs
-                processed = self.process_audio(full_chunk)
-                
-                # Apply crossfade for overlap-add
-                if self.prev_overlap is not None and len(processed) > self.overlap_samples:
-                    # Crossfade the overlap region
-                    for ch in range(CHANNELS):
-                        processed[:self.overlap_samples, ch] *= self.fade_in
-                
-                # Store overlap for next iteration
-                self.prev_overlap = full_chunk[-self.overlap_samples:]
-                
-                # Output the non-overlap portion
-                output_chunk = processed[self.overlap_samples:]
-                
-                # Add to output buffer
-                with self.buffer_lock:
-                    for sample in output_chunk:
-                        self.output_buffer.append(sample)
-                
-                proc_time = time.time() - start_time
-                print(f"[Demucs] Processed {len(full_chunk)/SAMPLE_RATE:.2f}s in {proc_time:.2f}s "
-                      f"(buffer: {buffer_samples/SAMPLE_RATE:.1f}s)")
-            else:
-                time.sleep(0.01)
-        
-        print("[Demucs] Processing thread stopped")
-    
-    def handle_client(self, conn, addr):
-        """Handle a connected client"""
-        print(f"[Demucs] Client connected: {addr}")
-        
-        try:
-            while self.running:
-                # Read header (4 bytes: num_samples as int32)
-                header = conn.recv(4)
-                if not header or len(header) < 4:
-                    break
-                
-                num_samples = struct.unpack('<I', header)[0]
-                
-                if num_samples == 0:
-                    # Heartbeat / status request
-                    with self.buffer_lock:
-                        output_available = len(self.output_buffer)
-                    conn.sendall(struct.pack('<I', output_available))
-                    continue
-                
-                if num_samples == 0xFFFFFFFF:
-                    # Request to read output
-                    with self.buffer_lock:
-                        available = min(4096, len(self.output_buffer))
-                        if available > 0:
-                            output_data = np.array([self.output_buffer.popleft() 
-                                                   for _ in range(available)])
-                        else:
-                            output_data = np.array([])
-                    
-                    # Send output
-                    conn.sendall(struct.pack('<I', len(output_data)))
-                    if len(output_data) > 0:
-                        conn.sendall(output_data.astype(np.float32).tobytes())
-                    continue
-                
-                # Read audio data
-                data_size = num_samples * CHANNELS * 4  # float32
-                audio_data = b''
-                while len(audio_data) < data_size:
-                    chunk = conn.recv(min(4096, data_size - len(audio_data)))
-                    if not chunk:
-                        break
-                    audio_data += chunk
-                
-                if len(audio_data) < data_size:
-                    break
-                
-                # Convert to numpy
-                samples = np.frombuffer(audio_data, dtype=np.float32).reshape(-1, CHANNELS)
-                
-                # Add to input buffer
-                with self.buffer_lock:
-                    for sample in samples:
-                        self.input_buffer.append(sample)
-                
-                # Send ack
-                conn.sendall(struct.pack('<I', len(samples)))
-                
-        except Exception as e:
-            print(f"[Demucs] Client error: {e}")
+                    raise ValueError(f"unexpected message type {msg_type}")
+        except (ConnectionError, OSError) as error:
+            log(f"Client disconnected: {error}")
+        except ValueError as error:
+            log(f"Protocol error: {error}")
         finally:
-            print(f"[Demucs] Client disconnected: {addr}")
-            conn.close()
-    
-    def start(self):
-        """Start the server"""
-        if not self.load_model():
-            print("[Demucs] Cannot start without model")
-            return False
-        
-        self.running = True
-        
-        # Start processing thread
-        self.processing_thread = threading.Thread(target=self.processing_loop, daemon=True)
-        self.processing_thread.start()
-        
-        # Start server
-        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server.bind((HOST, PORT))
-        self.server.listen(1)
-        
-        print(f"[Demucs] Server listening on {HOST}:{PORT}")
-        
-        try:
-            while self.running:
-                self.server.settimeout(1.0)
+            with self.lock:
+                self.closed = True
+                self.lock.notify()
+            self.conn.close()
+
+    def process_loop(self):
+        while True:
+            with self.lock:
+                while not self.closed and (self.stream is None or self.stream.pending_frames < self.stream.hop):
+                    self.lock.wait()
+                if self.closed:
+                    return
+                stream = self.stream
+                hop = stream.take_hop()
+            started = time.time()
+            try:
+                result = stream.step(self.separator, hop)
+            except Exception as error:  # noqa: BLE001 - keep the stream alive
+                log(f"Processing error: {error}")
+                continue
+            payload = result.astype("<f4").tobytes()
+            with self.lock:
+                if stream is not self.stream:
+                    continue  # reconfigured meanwhile: drop stale output
                 try:
-                    conn, addr = self.server.accept()
-                    client_thread = threading.Thread(
-                        target=self.handle_client, 
-                        args=(conn, addr),
-                        daemon=True
-                    )
-                    client_thread.start()
-                except socket.timeout:
-                    continue
-        except KeyboardInterrupt:
-            print("\n[Demucs] Shutting down...")
-        finally:
-            self.running = False
-            self.server.close()
-        
-        return True
-    
-    def stop(self):
-        """Stop the server"""
-        self.running = False
+                    send_message(self.conn, MSG_RESULT, result.shape[0], payload)
+                except OSError:
+                    return
+            log(f"Processed {HOP_S:.1f}s in {time.time() - started:.2f}s")
+
+
+def watch_parent(parent_pid):
+    """Exit when the app that launched us is gone (crash, force quit)."""
+    while True:
+        if os.getppid() != parent_pid:
+            log("Parent process exited, shutting down")
+            os._exit(0)
+        time.sleep(1.0)
 
 
 def main():
-    print("=" * 50)
-    print("Demucs Vocal Separation Server")
-    print("=" * 50)
-    print(f"PyTorch: {torch.__version__}")
-    print(f"MPS available: {torch.backends.mps.is_available()}")
-    print()
-    
-    server = DemucsServer()
-    server.start()
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--port", type=int, default=19845)
+    parser.add_argument("--parent-pid", type=int, default=None)
+    args = parser.parse_args()
+
+    if args.parent_pid:
+        threading.Thread(target=watch_parent, args=(args.parent_pid,), daemon=True).start()
+
+    log(f"PyTorch {torch.__version__}, MPS available: {torch.backends.mps.is_available()}")
+    separator = Separator()
+    if not separator.load():
+        log("Cannot start without a model")
+        return 2
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        server.bind(("127.0.0.1", args.port))
+    except OSError as error:
+        log(f"Cannot listen on port {args.port}: {error}")
+        return 3
+    server.listen(1)
+    log(f"Listening on 127.0.0.1:{args.port}")
+
+    try:
+        while True:
+            conn, addr = server.accept()
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            log(f"Client connected: {addr}")
+            # One client at a time: the app is the only user
+            Connection(conn, separator).serve()
+    except KeyboardInterrupt:
+        log("Shutting down")
+    finally:
+        server.close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
