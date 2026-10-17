@@ -48,7 +48,7 @@ Les FIFO (`RingBuffer`) sont préallouées et protégées par `os_unfair_lock`. 
 | `Compressor.swift` | Compresseur crête par blocs de 32 frames |
 | `Equalizer.swift` | 8 biquads (RBJ, Q = 1) en SIMD8, contournement quand tout est à 0 dB |
 | `MidSideKaraoke.swift` | Karaoké instantané, Mid-Side sur 3 bandes |
-| `AudioVisualizer.swift` | FFT 1024 points (20 i/s) et oscilloscope (60 i/s), `VisualizationTap` |
+| `AudioVisualizer.swift` | FFT 1024 points et oscilloscope, 30 i/s synchronisés, `VisualizationTap` |
 | `DemucsProtocol.swift` | Format des messages client/serveur (v2) |
 | `DemucsBridge.swift` | FIFO entrée/sortie du karaoké IA, mélange sec/traité aligné |
 
