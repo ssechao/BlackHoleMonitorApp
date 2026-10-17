@@ -203,20 +203,30 @@ struct MenuBarView: View {
                                 Text("Demucs AI")
                                     .font(.caption2)
                                 if audioManager.karaokeUseAI {
-                                    if audioManager.karaokeAIAvailable {
-                                        Text("(~3s latency)")
+                                    switch audioManager.karaokeAIStatus {
+                                    case .ready:
+                                        Text("(~4s latency)")
                                             .font(.caption2)
                                             .foregroundColor(.orange)
-                                    } else {
-                                        Text("connecting...")
+                                    case .starting:
+                                        Text("loading model...")
                                             .font(.caption2)
                                             .foregroundColor(.yellow)
+                                    case .off, .failed:
+                                        EmptyView()
                                     }
                                 }
                             }
                         }
                         .toggleStyle(.switch)
                         .controlSize(.mini)
+
+                        if audioManager.karaokeUseAI, case .failed(let message) = audioManager.karaokeAIStatus {
+                            Text("\(message) — using Mid-Side. Toggle Demucs to retry.")
+                                .font(.caption2)
+                                .foregroundColor(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                         
                         if !audioManager.karaokeUseAI {
                             Text("Mid-Side mode (instant, basic)")
@@ -379,7 +389,7 @@ struct MenuBarView: View {
                 try SMAppService.mainApp.unregister()
             }
         } catch {
-            print("Failed to set auto-start: \(error)")
+            Log.app.error("Failed to set auto-start: \(error)")
         }
     }
     

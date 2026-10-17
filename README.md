@@ -17,7 +17,9 @@ A macOS menu bar app for audio routing, monitoring, and processing using BlackHo
 
 - macOS 13.0+
 - [BlackHole](https://github.com/ExistentialAudio/BlackHole) virtual audio driver
-- For AI Karaoke: Python 3 with Demucs (`pip install demucs`)
+- For AI Karaoke: Python 3 with Demucs (`pip install demucs`). The app picks the first
+  `python3` that can import `demucs`; override with
+  `defaults write com.blackhole.monitor demucsPythonPath /path/to/python3`
 
 ## Building
 
@@ -25,7 +27,21 @@ A macOS menu bar app for audio routing, monitoring, and processing using BlackHo
 ./build.sh
 ```
 
-The app will be built to `build/BlackHoleMonitorApp.app`
+The app will be built to `build/BlackHoleMonitorApp.app` (arm64 by default,
+`ARCHS="arm64 x86_64" ./build.sh` for a universal binary).
+
+## Tests
+
+```bash
+swift test                     # XCTest suite for the real-time DSP code
+swift test --sanitize=thread   # same, under Thread Sanitizer
+```
+
+## Logs
+
+```bash
+log stream --level info --predicate 'subsystem == "com.blackhole.monitor"'
+```
 
 ## Installation
 
@@ -53,22 +69,25 @@ Audio Source → BlackHole → BlackHoleMonitorApp → Output Device
 
 ## Audio Processing Pipeline
 
-1. **Input**: Capture from BlackHole via AudioUnit
-2. **Resampling**: VDSPResampler with cubic Hermite interpolation (if needed)
-3. **Karaoke**: Mid-Side processing or Demucs AI
-4. **Compression**: Optimized block-based compressor with pre-allocated buffers
-5. **EQ**: 8 biquad peak filters with anti-denormal protection
-6. **Output**: Route to selected output device
+1. **Input**: Capture from BlackHole via AUHAL (interleaved or planar)
+2. **Resampling**: Streaming Catmull-Rom resampler with drift correction (if rates differ)
+3. **Ring buffer**: 30 ms target, grows automatically after underruns (CPU overload)
+4. **Karaoke**: Mid-Side processing or Demucs AI (~4 s latency)
+5. **Compression**: Block-based peak compressor
+6. **EQ**: 8 biquad peak filters
+7. **Output**: Route to selected output device
+
+Audio callbacks never allocate, log or block; settings reach them through
+lock-free-for-the-reader mailboxes. See `docs/ARCHITECTURE.md`.
 
 ## Files
 
-- `BlackHoleMonitorApp.swift` - Main app and menu bar
-- `AudioManager.swift` - Core audio routing and processing
-- `MenuBarView.swift` - SwiftUI interface
-- `OptimizedAudioProcessing.swift` - TDD-tested compressor and drift controller
-- `VocalSeparatorAI.swift` - Demucs integration for AI vocal removal
-- `SpectrumAnalyzerView.swift` - FFT visualization
-- `DiscoView.swift` - Audio-reactive fullscreen effects
+- `BlackHoleMonitorApp.swift` - App delegate, menu bar, Background Music volume sync
+- `AudioManager.swift` - Settings, devices, session lifecycle (main thread)
+- `AudioSession.swift` - CoreAudio units and real-time render callbacks
+- `VocalSeparatorAI.swift` - Demucs server launcher and client
+- `DSP/` - Real-time processing (ring buffer, resampler, compressor, EQ, karaoke, spectrum, Demucs protocol), unit tested
+- `MenuBarView.swift`, `SpectrumAnalyzerView.swift`, `OscilloscopeView.swift`, `DiscoView.swift` - UI
 - `ML/demucs_server.py` - Python server for Demucs vocal separation
 
 ## License

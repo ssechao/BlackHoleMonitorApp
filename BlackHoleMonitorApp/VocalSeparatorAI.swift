@@ -1,285 +1,371 @@
 import Foundation
 import Network
 
-/// Demucs-based vocal separator using a Python server
-/// Provides high-quality vocal separation with ~3s latency
+/// Client of the Demucs server (`ML/demucs_server.py`), see `DemucsProtocol`.
+///
+/// - The Python server is launched only while AI karaoke is requested, and
+///   terminated when it is turned off or the app quits (the server also exits
+///   by itself if the app dies, via `--parent-pid`).
+/// - All network and process state is confined to `queue`. The audio thread
+///   only touches the current `DemucsBridge` FIFOs.
 final class VocalSeparatorAI {
-    
-    private let host = "127.0.0.1"
-    private let port: UInt16 = 19845
+    enum Status: Equatable {
+        case off
+        case starting
+        case ready
+        case failed(String)
+    }
+
+    /// Called on the main thread.
+    var onStatusChanged: ((Status) -> Void)?
+
+    static let port: UInt16 = 19845
+    private static let sendChunkFrames = 4096
+    private static let handshakeTimeout: TimeInterval = 10
+
+    private let queue = DispatchQueue(label: "com.blackhole.monitor.demucs", qos: .userInitiated)
+    private let log = Log.demucs
+
+    // Queue-confined state
+    private var active = false
+    private var status: Status = .off
+    private var bridge: DemucsBridge?
+    private var process: Process?
     private var connection: NWConnection?
-    private var isConnected = false
-    private var serverProcess: Process?
-    
-    private let channels: Int = 2
-    private var inputBuffer: [Float] = []
-    private var outputBuffer: [Float] = []
-    private let bufferLock = NSLock()
-    
-    // Latency buffer (3 seconds worth of samples)
-    private let latencySeconds: Double = 3.0
-    private let sampleRate: Double = 44100
-    private var latencySamples: Int { Int(latencySeconds * sampleRate) }
-    
-    private var _isAvailable = false
-    
-    // Callback when connection state changes
-    var onConnectionChanged: ((Bool) -> Void)?
-    
+    private var handshakeDone = false
+    private var sendTimer: DispatchSourceTimer?
+    private var retryWork: DispatchWorkItem?
+    private var timeoutWork: DispatchWorkItem?
+    private let sendScratch: UnsafeMutablePointer<Float>
+
     init() {
-        startServer()
+        let count = Self.sendChunkFrames * DemucsProtocol.inputChannels
+        sendScratch = UnsafeMutablePointer<Float>.allocate(capacity: count)
+        sendScratch.initialize(repeating: 0, count: count)
     }
-    
+
     deinit {
-        stopServer()
+        sendScratch.deallocate()
     }
-    
-    /// Check if Demucs server is available
-    var isAvailable: Bool {
-        return _isAvailable && isConnected
+
+    // MARK: - Public API (main thread)
+
+    func setActive(_ active: Bool) {
+        queue.async { active ? self.activate() : self.deactivate() }
     }
-    
-    // MARK: - Server Management
-    
-    private func startServer() {
-        // Find the demucs_server.py script
-        let scriptPaths = [
-            Bundle.main.resourcePath.map { "\($0)/demucs_server.py" },
-            Bundle.main.bundlePath + "/../ML/demucs_server.py",
-            "/Users/sechaosouchiam/Source/github.com/BlackHoleMonitorApp/ML/demucs_server.py"
-        ].compactMap { $0 }
-        
-        var scriptPath: String?
-        for path in scriptPaths {
-            if FileManager.default.fileExists(atPath: path) {
-                scriptPath = path
-                break
+
+    /// Bridge of the running audio session (nil when stopped).
+    func attach(bridge: DemucsBridge?) {
+        queue.async {
+            self.bridge = bridge
+            self.handshakeDone = false
+            if bridge != nil, self.connection?.state == .ready {
+                self.sendHello()
             }
         }
-        
-        guard let script = scriptPath else {
-            print("[Demucs] Server script not found")
-            _isAvailable = false
-            return
-        }
-        
-        print("[Demucs] Starting server from: \(script)")
-        
-        // Start Python server in background
-        DispatchQueue.global(qos: .background).async { [weak self] in
-            self?.launchServer(script: script)
-        }
-        
-        // Try to connect after a delay (let server start)
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 5.0) { [weak self] in
-            self?.connectToServer()
+    }
+
+    /// Synchronous: terminates the server before the app exits.
+    func shutdown() {
+        queue.sync {
+            active = false
+            tearDown()
         }
     }
-    
-    private func launchServer(script: String) {
+
+    // MARK: - Lifecycle
+
+    private func activate() {
+        guard !active else { return }
+        active = true
+        setStatus(.starting)
+        launchServer()
+        scheduleConnect(after: 1.0)
+    }
+
+    private func deactivate() {
+        guard active else { return }
+        active = false
+        tearDown()
+        setStatus(.off)
+    }
+
+    private func fail(_ message: String) {
+        log.error(message)
+        active = false
+        tearDown()
+        setStatus(.failed(message))
+    }
+
+    private func tearDown() {
+        retryWork?.cancel()
+        retryWork = nil
+        timeoutWork?.cancel()
+        timeoutWork = nil
+        sendTimer?.cancel()
+        sendTimer = nil
+        connection?.cancel()
+        connection = nil
+        handshakeDone = false
+        if let process, process.isRunning {
+            process.terminate()
+            log.info("Server stopped")
+        }
+        process = nil
+    }
+
+    private func setStatus(_ newStatus: Status) {
+        guard newStatus != status else { return }
+        status = newStatus
+        DispatchQueue.main.async { [weak self] in
+            self?.onStatusChanged?(newStatus)
+        }
+    }
+
+    // MARK: - Server process
+
+    private func launchServer() {
+        guard let script = Self.findScript() else {
+            fail("demucs_server.py not found")
+            return
+        }
+        guard let python = Self.findPython() else {
+            fail("No python3 with demucs found (pip install demucs, or set the demucsPythonPath default)")
+            return
+        }
+
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["python3", script]
-        process.environment = ProcessInfo.processInfo.environment
-        
-        // Redirect output for debugging (use notification-based approach to avoid CPU spin)
+        process.executableURL = URL(fileURLWithPath: python)
+        process.arguments = [script, "--port", "\(Self.port)", "--parent-pid", "\(getpid())"]
+        var environment = ProcessInfo.processInfo.environment
+        environment["PYTHONUNBUFFERED"] = "1"
+        process.environment = environment
+
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
-        
-        // Use notification-based reading instead of readabilityHandler to avoid CPU spinning
-        let handle = pipe.fileHandleForReading
-        NotificationCenter.default.addObserver(
-            forName: .NSFileHandleDataAvailable,
-            object: handle,
-            queue: nil
-        ) { [weak handle] _ in
-            guard let handle = handle else { return }
+        let log = self.log
+        pipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
-            if data.count > 0, let line = String(data: data, encoding: .utf8) {
-                print("[Demucs Server] \(line)", terminator: "")
+            guard !data.isEmpty else {
+                // EOF: detach, otherwise the handler is called in a loop
+                handle.readabilityHandler = nil
+                return
             }
-            // Continue waiting for more data if process is running
-            if data.count > 0 {
-                handle.waitForDataInBackgroundAndNotify()
-            }
+            String(decoding: data, as: UTF8.self).split(separator: "\n").forEach { log.info("server: \($0)") }
         }
-        handle.waitForDataInBackgroundAndNotify()
-        
+        process.terminationHandler = { [weak self] terminated in
+            self?.queue.async { self?.serverTerminated(terminated) }
+        }
+
         do {
             try process.run()
-            serverProcess = process
-            print("[Demucs] Server process started (PID: \(process.processIdentifier))")
+            self.process = process
+            log.info("Server started with \(python) \(script) (pid \(process.processIdentifier))")
         } catch {
-            print("[Demucs] Failed to start server: \(error)")
+            fail("Cannot start Demucs server: \(error.localizedDescription)")
         }
     }
-    
-    private func stopServer() {
-        connection?.cancel()
-        connection = nil
-        isConnected = false
-        
-        if let process = serverProcess, process.isRunning {
-            process.terminate()
-            print("[Demucs] Server stopped")
+
+    private func serverTerminated(_ terminated: Process) {
+        guard terminated === process else { return }
+        process = nil
+        guard active else { return }
+        switch terminated.terminationStatus {
+        case 2: fail("Demucs model could not be loaded (see logs)")
+        case 3: fail("Port \(Self.port) is already in use")
+        default: fail("Demucs server exited (code \(terminated.terminationStatus), see logs)")
         }
-        serverProcess = nil
     }
-    
+
+    private static func findScript() -> String? {
+        var candidates: [String] = []
+        if let resources = Bundle.main.resourcePath {
+            candidates.append("\(resources)/demucs_server.py")
+        }
+        // Development: build/BlackHoleMonitorApp.app -> <repo>/ML
+        candidates.append(Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("ML/demucs_server.py").path)
+        return candidates.first { FileManager.default.fileExists(atPath: $0) }
+    }
+
+    /// GUI apps get a minimal PATH, so look in the usual install locations and
+    /// keep the first interpreter that can actually import demucs and torch.
+    /// An explicit override (`demucsPythonPath` default or `BHM_PYTHON`) is used as is.
+    private static func findPython() -> String? {
+        let overrides = [UserDefaults.standard.string(forKey: "demucsPythonPath"),
+                         ProcessInfo.processInfo.environment["BHM_PYTHON"]].compactMap { $0 }
+        if let custom = overrides.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            return custom
+        }
+        let candidates = [
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+            "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
+            "/usr/bin/python3",
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) && hasDemucs($0) }
+    }
+
+    /// Checks the modules without importing them (fast), with the same
+    /// user site-packages fallback as the server.
+    private static func hasDemucs(_ python: String) -> Bool {
+        let probe = """
+        import importlib.util, os, sys
+        v = f"{sys.version_info.major}.{sys.version_info.minor}"
+        sys.path.append(os.path.expanduser(f"~/Library/Python/{v}/lib/python{v}/site-packages"))
+        sys.exit(0 if all(importlib.util.find_spec(m) for m in ("demucs", "torch", "torchaudio")) else 1)
+        """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: python)
+        process.arguments = ["-c", probe]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return false
+        }
+        process.waitUntilExit()
+        return process.terminationStatus == 0
+    }
+
     // MARK: - Connection
-    
-    private func connectToServer() {
-        let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!)
-        connection = NWConnection(to: endpoint, using: .tcp)
-        
-        connection?.stateUpdateHandler = { [weak self] state in
+
+    private func scheduleConnect(after delay: TimeInterval) {
+        retryWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.connect() }
+        retryWork = work
+        queue.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func connect() {
+        guard active, connection == nil, process != nil else { return }
+        let conn = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: Self.port)!, using: .tcp)
+        connection = conn
+        conn.stateUpdateHandler = { [weak self, weak conn] state in
+            guard let self, let conn, conn === self.connection else { return }
             switch state {
             case .ready:
-                print("[Demucs] Connected to server")
-                self?.isConnected = true
-                self?._isAvailable = true
-                DispatchQueue.main.async {
-                    self?.onConnectionChanged?(true)
-                }
-                self?.startReceiving()
-            case .failed(let error):
-                print("[Demucs] Connection failed: \(error)")
-                self?.isConnected = false
-                self?._isAvailable = false
-                DispatchQueue.main.async {
-                    self?.onConnectionChanged?(false)
-                }
-                // Retry after delay
-                DispatchQueue.global().asyncAfter(deadline: .now() + 2.0) {
-                    self?.connectToServer()
-                }
-            case .cancelled:
-                self?.isConnected = false
-                DispatchQueue.main.async {
-                    self?.onConnectionChanged?(false)
-                }
+                self.log.info("Connected to server")
+                self.receiveMessage(on: conn)
+                if self.bridge != nil { self.sendHello() }
+            case .waiting, .failed:
+                // Typically "connection refused" while the model is loading
+                self.connectionLost()
             default:
                 break
             }
         }
-        
-        connection?.start(queue: .global(qos: .userInteractive))
+        conn.start(queue: queue)
     }
-    
-    private func startReceiving() {
-        receiveData()
+
+    private func connectionLost() {
+        connection?.cancel()
+        connection = nil
+        handshakeDone = false
+        sendTimer?.cancel()
+        sendTimer = nil
+        timeoutWork?.cancel()
+        guard active else { return }
+        if status == .ready { setStatus(.starting) }
+        scheduleConnect(after: 1.0)
     }
-    
-    private func receiveData() {
-        guard let connection = connection, isConnected else { return }
-        
-        // Continuously poll for output from server
-        connection.receive(minimumIncompleteLength: 4, maximumLength: 65536) { [weak self] content, _, isComplete, error in
-            if let data = content {
-                self?.handleReceivedData(data)
-            }
-            
-            if isComplete || error != nil {
-                self?.isConnected = false
+
+    private func sendHello() {
+        guard let conn = connection, let bridge else { return }
+        handshakeDone = false
+        bridge.resetStreams()
+        conn.send(content: DemucsProtocol.encodeHeader(.hello, value: UInt32(bridge.sampleRate)),
+                  completion: .contentProcessed { _ in })
+
+        timeoutWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.fail("No answer from Demucs server (port \(VocalSeparatorAI.port) used by another program?)")
+        }
+        timeoutWork = work
+        queue.asyncAfter(deadline: .now() + Self.handshakeTimeout, execute: work)
+    }
+
+    // MARK: - Receiving (exact framing)
+
+    private func receiveMessage(on conn: NWConnection) {
+        let headerSize = DemucsProtocol.headerSize
+        conn.receive(minimumIncompleteLength: headerSize, maximumLength: headerSize) { [weak self] data, _, isComplete, error in
+            guard let self, conn === self.connection else { return }
+            guard error == nil, let data, data.count == headerSize else {
+                if error != nil || isComplete { self.connectionLost() }
                 return
             }
-            
-            // Continue receiving
-            self?.receiveData()
-        }
-    }
-    
-    private func handleReceivedData(_ data: Data) {
-        // Parse response from server
-        guard data.count >= 4 else { return }
-        
-        let numSamples = data.withUnsafeBytes { $0.load(as: UInt32.self) }
-        
-        if numSamples > 0 && data.count >= 4 + Int(numSamples) * channels * 4 {
-            let audioData = data.subdata(in: 4..<(4 + Int(numSamples) * channels * 4))
-            let samples = audioData.withUnsafeBytes { ptr -> [Float] in
-                Array(ptr.bindMemory(to: Float.self))
+            let header: DemucsProtocol.Header
+            do {
+                header = try DemucsProtocol.decodeHeader(data)
+            } catch {
+                self.log.error("Protocol error: \(error)")
+                self.connectionLost()
+                return
             }
-            
-            bufferLock.lock()
-            outputBuffer.append(contentsOf: samples)
-            bufferLock.unlock()
-        }
-    }
-    
-    // MARK: - Audio Processing
-    
-    /// Process audio buffer to remove vocals
-    func process(_ data: UnsafeMutablePointer<Float>, frameCount: Int, intensity: Float) {
-        guard isConnected, intensity > 0 else { return }
-        
-        let sampleCount = frameCount * channels
-        
-        // Store original audio for mixing
-        var originalAudio = [Float](repeating: 0, count: sampleCount)
-        for i in 0..<sampleCount {
-            originalAudio[i] = data[i]
-        }
-        
-        // Send audio to server
-        sendAudioToServer(data, frameCount: frameCount)
-        
-        // Request processed output
-        requestOutput()
-        
-        // Get processed output (with latency)
-        bufferLock.lock()
-        let availableOutput = min(sampleCount, outputBuffer.count)
-        
-        if availableOutput > 0 {
-            // Mix processed output with original based on intensity
-            for i in 0..<availableOutput {
-                let processed = outputBuffer[i]
-                let original = originalAudio[i]
-                data[i] = original * (1.0 - intensity) + processed * intensity
+            let payloadSize = DemucsProtocol.payloadSize(of: header)
+            if payloadSize == 0 {
+                self.handle(header, payload: Data())
+                self.receiveMessage(on: conn)
+                return
             }
-            outputBuffer.removeFirst(availableOutput)
-            
-            // Fill remaining with original (latency compensation)
-            for i in availableOutput..<sampleCount {
-                data[i] = originalAudio[i]
+            conn.receive(minimumIncompleteLength: payloadSize, maximumLength: payloadSize) { [weak self] payload, _, _, error in
+                guard let self, conn === self.connection else { return }
+                guard error == nil, let payload, payload.count == payloadSize else {
+                    self.connectionLost()
+                    return
+                }
+                self.handle(header, payload: payload)
+                self.receiveMessage(on: conn)
             }
         }
-        bufferLock.unlock()
     }
-    
-    private func sendAudioToServer(_ data: UnsafePointer<Float>, frameCount: Int) {
-        guard let connection = connection, isConnected else { return }
-        
-        // Create packet: [num_samples (4 bytes)] [audio data (num_samples * channels * 4 bytes)]
-        var packet = Data()
-        var numSamples = UInt32(frameCount)
-        packet.append(Data(bytes: &numSamples, count: 4))
-        packet.append(Data(bytes: data, count: frameCount * channels * MemoryLayout<Float>.size))
-        
-        connection.send(content: packet, completion: .contentProcessed { error in
-            if let error = error {
-                print("[Demucs] Send error: \(error)")
+
+    private func handle(_ header: DemucsProtocol.Header, payload: Data) {
+        switch header.type {
+        case .helloAck:
+            timeoutWork?.cancel()
+            guard header.value == DemucsProtocol.version else {
+                fail("Incompatible Demucs server (protocol v\(header.value), expected v\(DemucsProtocol.version))")
+                return
             }
-        })
+            handshakeDone = true
+            startSendTimer()
+            setStatus(.ready)
+        case .result:
+            guard handshakeDone, let bridge else { return }
+            let floats = DemucsProtocol.decodeFloats(payload)
+            floats.withUnsafeBufferPointer {
+                bridge.receiveResult($0.baseAddress!, frames: Int(header.value))
+            }
+        case .hello, .audio:
+            log.error("Unexpected message from server: \(header.type)")
+            connectionLost()
+        }
     }
-    
-    private func requestOutput() {
-        guard let connection = connection, isConnected else { return }
-        
-        // Request output: send 0xFFFFFFFF as num_samples
-        var request = UInt32(0xFFFFFFFF)
-        let packet = Data(bytes: &request, count: 4)
-        
-        connection.send(content: packet, completion: .contentProcessed { _ in })
+
+    // MARK: - Sending
+
+    private func startSendTimer() {
+        sendTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(20), leeway: .milliseconds(5))
+        timer.setEventHandler { [weak self] in self?.flushInput() }
+        timer.resume()
+        sendTimer = timer
     }
-    
-    /// Reset the processor state
-    func reset() {
-        bufferLock.lock()
-        inputBuffer.removeAll()
-        outputBuffer.removeAll()
-        bufferLock.unlock()
+
+    private func flushInput() {
+        guard handshakeDone, let conn = connection, let bridge else { return }
+        while true {
+            let frames = bridge.toServer.readAvailable(into: sendScratch, maxFrames: Self.sendChunkFrames)
+            if frames == 0 { break }
+            conn.send(content: DemucsProtocol.encodeAudio(sendScratch, frames: frames),
+                      completion: .contentProcessed { [log] error in
+                          if let error { log.error("Send error: \(error)") }
+                      })
+        }
     }
 }

@@ -1,100 +1,151 @@
 # Architecture - BlackHoleMonitorApp
 
-Application macOS menu bar en Swift/SwiftUI (~4 100 lignes) qui intercepte et traite l'audio systeme en temps reel via le driver audio virtuel BlackHole/Background Music.
+Application macOS de barre de menus en Swift/SwiftUI qui intercepte et traite l'audio système en temps réel via le pilote audio virtuel BlackHole/Background Music.
 
 ## Vue d'ensemble
 
 ```
-AppDelegate (point d'entree, menu bar + popover)
+AppDelegate (point d'entrée, barre de menus + popover, volume Background Music)
     |
-    +-- AudioManager (coeur, singleton)
-    |   +-- Capture CoreAudio (entree/sortie via AUHAL)
-    |   +-- Reechantillonnage vDSP (interpolation cubique)
-    |   +-- OptimizedCompressor (compression dynamique)
-    |   +-- OptimizedRingBuffer (buffer circulaire thread-safe)
-    |   +-- SmoothDriftController (correction latence)
-    |   +-- EQ 8 bandes (filtres Biquad)
-    |   +-- Karaoke (mid-side ou IA Demucs)
-    |   +-- VocalSeparatorAI (client TCP -> serveur Python Demucs)
+    +-- AudioManager (thread principal : réglages, périphériques, cycle de vie)
+    |   +-- AudioSession (une par démarrage, tout l'état temps réel)
+    |   |   +-- AUHAL d'entrée -> Resampler -> RingBuffer
+    |   |   +-- RingBuffer -> karaoké -> Compressor -> Equalizer -> AudioVisualizer -> AUHAL de sortie
+    |   |   +-- DemucsBridge (FIFO thread audio <-> réseau)
+    |   +-- VocalSeparatorAI (client TCP + processus Python Demucs, file dédiée)
+    |   +-- VisualizationTap -> minuterie 60 Hz -> VisualizationData (@Published)
     |
-    +-- MenuBarView (UI SwiftUI - controles)
-    |
-    +-- Visualisations
-        +-- SpectrumAnalyzerView (16 barres FFT)
-        +-- OscilloscopeView (forme d'onde phosphore vert)
-        +-- DiscoView (animation 60fps reactive a l'audio)
-        +-- SpectrumFloatingWindow (fenetre flottante)
+    +-- MenuBarView (UI SwiftUI - contrôles)
+    +-- Visualisations : SpectrumAnalyzerView, OscilloscopeView, DiscoView, SpectrumFloatingWindow
 ```
+
+## Modèle de threads
+
+| Thread | Rôle | Règles |
+|---|---|---|
+| Principal | UI, `AudioManager`, création/arrêt de `AudioSession` | Publie les réglages, ne touche jamais à l'état des callbacks |
+| Callback d'entrée (AUHAL) | Capture, désentrelacement, rééchantillonnage, écriture dans le `RingBuffer` | Aucune allocation, aucun log, aucun `DispatchQueue.async` |
+| Callback de sortie (AUHAL) | Lecture du `RingBuffer`, traitement, copie vers le périphérique | Idem |
+| File `com.blackhole.monitor.demucs` | Connexion TCP, processus Python, envoi/réception | Ne parle au thread audio que via les FIFO de `DemucsBridge` |
+
+Les réglages passent du thread principal vers les threads audio par **`ParameterMailbox`** : l'écrivain publie une valeur complète sous verrou ; les lecteurs audio n'utilisent que `os_unfair_lock_trylock` et gardent leur copie précédente si le verrou est pris. Les valeurs sont des structures simples (SIMD, flottants, booléens), donc leur copie ne fait ni retain, ni release, ni libération mémoire.
+
+- `RenderParameters` : volume, activations, intensité du karaoké, correction de dérive, visualisation.
+- `Compressor.Parameters` et `Equalizer.Coefficients` : coefficients précalculés sur le thread principal. L'égaliseur change de coefficients **sans réinitialiser l'état des filtres**, donc sans clic.
+
+Les FIFO (`RingBuffer`) sont préallouées et protégées par `os_unfair_lock`. Le verrou n'est tenu que le temps d'un `memcpy` borné, et il transmet sa priorité au détenteur, ce qui évite l'inversion de priorité.
 
 ## Fichiers sources
 
-| Fichier | Lignes | Role |
-|---|---|---|
-| `AudioManager.swift` | ~1600 | Coeur : capture CoreAudio, traitement temps reel (compresseur, EQ, karaoke), reechantillonnage vDSP, FFT, oscilloscope |
-| `OptimizedAudioProcessing.swift` | ~386 | `SmoothDriftController` (correction latence), `OptimizedCompressor` (enveloppe attack/release, protection denormales), `OptimizedRingBuffer` (ring buffer thread-safe avec fade-in/out) |
-| `VocalSeparatorAI.swift` | ~286 | Client TCP vers serveur Python Demucs (port 19845), separation vocale IA avec latence ~3s |
-| `BlackHoleMonitorApp.swift` | ~267 | `AppDelegate`, barre de menu, popover, listeners CoreAudio (volume/mute) |
-| `MenuBarView.swift` | ~394 | Interface SwiftUI : selection E/S, volume, compresseur, karaoke, EQ, toggles disco/spectrum |
-| `DiscoView.swift` | ~390 | Animation disco 60fps : gradient pulsant (basses), aurores (mids), lasers (aigus), boule disco, 50 particules, strobe |
-| `SpectrumFloatingWindow.swift` | ~125 | Fenetre flottante borderless avec spectre + oscilloscope + EQ 8 bandes |
-| `SpectrumAnalyzerView.swift` | ~85 | 16 barres x 12 segments colores (vert/orange/rouge), rendu Canvas + drawingGroup() |
-| `OscilloscopeView.swift` | ~53 | Trace forme d'onde avec effet halo phosphore multi-couches |
-| `VerticalSliderView.swift` | ~55 | NSViewRepresentable pour slider vertical (EQ) |
-| `DriftCorrectionTests.swift` | ~213 | 8 tests unitaires : drift, compresseur, ring buffer |
+### `BlackHoleMonitorApp/DSP/` - code temps réel pur (module `AudioCore` testé par `swift test`)
+
+| Fichier | Rôle |
+|---|---|
+| `ParameterMailbox.swift` | Transfert de paramètres thread principal -> threads audio, sans blocage côté audio |
+| `RingBuffer.swift` | FIFO multicanale : amorçage, latence adaptative, fondus, vidage d'urgence |
+| `Resampler.swift` | Interpolation Catmull-Rom en flux, phase continue entre les buffers |
+| `DriftController.swift` | Ajuste le ratio de rééchantillonnage (±0,1 %) selon le remplissage du tampon |
+| `Compressor.swift` | Compresseur crête par blocs de 32 frames |
+| `Equalizer.swift` | 8 biquads (RBJ, Q = 1) en SIMD8, contournement quand tout est à 0 dB |
+| `MidSideKaraoke.swift` | Karaoké instantané, Mid-Side sur 3 bandes |
+| `AudioVisualizer.swift` | FFT 1024 points (20 i/s) et oscilloscope (60 i/s), `VisualizationTap` |
+| `DemucsProtocol.swift` | Format des messages client/serveur (v2) |
+| `DemucsBridge.swift` | FIFO entrée/sortie du karaoké IA, mélange sec/traité aligné |
+
+### Application
+
+| Fichier | Rôle |
+|---|---|
+| `AudioSession.swift` | Unités AUHAL, callbacks, tampons préalloués, entrelacement |
+| `AudioManager.swift` | Réglages `@Published`, persistance (différée de 0,5 s), périphériques, reconnexion USB |
+| `VocalSeparatorAI.swift` | Lancement à la demande du serveur Python, connexion, découpage exact des messages |
+| `AudioDevices.swift` | Requêtes CoreAudio (noms, canaux, fréquences) partagées |
+| `Log.swift` | Journalisation unifiée (`os.Logger`) |
+| `BlackHoleMonitorApp.swift` | `AppDelegate`, popover, écouteurs de volume/muet de Background Music |
+| `MenuBarView.swift`, `*View.swift`, `*Window.swift` | Interface |
 
 ## Pipeline audio
 
-1. **Capture** : AUHAL input callback recoit l'audio de BlackHole/Background Music
-2. **Ring Buffer** : ecriture thread-safe avec protection underrun
-3. **Drift Correction** : `SmoothDriftController` ajuste le ratio de reechantillonnage pour compenser la derive entre horloges d'entree/sortie
-4. **Reechantillonnage** : `VDSPResampler` avec interpolation cubique (4 points)
-5. **Compresseur** : enveloppe attack/release, threshold/ratio/makeup gain, protection denormales via vDSP
-6. **EQ** : 8 filtres Biquad parametriques (-12/+12 dB) par canal
-7. **Karaoke** : soustraction mid-side (stereo) ou separation vocale IA via Demucs
-8. **Sortie** : AUHAL output callback vers le peripherique de sortie selectionne
-9. **Visualisation** (conditionnelle) : FFT 1024 points -> 16 bandes spectre, oscilloscope 256 samples
+1. **Capture** : le callback d'entrée appelle `AudioUnitRender` avec l'horodatage et les drapeaux reçus. Il utilise une `AudioBufferList` préallouée : un tampon si le format est entrelacé, un tampon par canal sinon.
+2. **Désentrelacement** si besoin (`vDSP_ztoc`).
+3. **Rééchantillonnage** (si les fréquences diffèrent) avec le ratio corrigé par `DriftController`. La position de lecture est suivie en continu : le débit moyen est exact, sans saut de phase.
+4. **Ring buffer** : cible de 30 ms. Après une sous-alimentation, la cible augmente de 10 ms, jusqu'à 150 ms au maximum.
+5. **Karaoké** : Mid-Side (fréquence de sortie) ou flux Demucs retardé.
+6. **Compresseur**, **égaliseur**, **visualisation** (seulement si une vue est ouverte), **volume** (courbe x³).
+7. **Sortie** : copie vers les tampons de l'AUHAL, entrelacés ou non (`vDSP_ctoz`).
 
-## Systeme de visualisation
+Le traitement se fait par blocs de 4096 frames au plus. `kAudioUnitProperty_MaximumFramesPerSlice` est fixé à 4096 pour les deux unités.
 
-Les visualisations sont decoupees du pipeline audio principal via un flag `visualizationActive` :
+## Comportement en surcharge CPU
 
-- `VisualizationData` : objet `@ObservableObject` isole qui porte `spectrumBands` et `oscilloscopeSamples`
-- Les vues (`SpectrumAnalyzerView`, `OscilloscopeView`) observent uniquement `VisualizationData`, pas `AudioManager` -> evite les re-renders de `MenuBarView`
-- `SpectrumContainerView` et `OscilloscopeContainerView` : conteneurs d'isolation SwiftUI
+Avant, chaque callback allouait plusieurs tableaux et envoyait des blocs sur la file principale. Sous charge, cela provoquait de courtes coupures en rafale : des craquements. Désormais :
 
-### Gestion du flag `visualizationActive`
+- les callbacks n'allouent rien et ne prennent jamais de verrou bloquant pour lire les paramètres ;
+- après une sous-alimentation, le `RingBuffer` reste silencieux (avec fondu) jusqu'à retrouver sa cible. On obtient **une seule coupure nette** au lieu d'une rafale de micro-coupures ;
+- la cible de latence augmente automatiquement pour absorber la charge. Le nombre de sous-alimentations et la latence finale sont journalisés à l'arrêt.
 
-| Evenement | Action |
+## Karaoké IA (Demucs)
+
+```
+thread audio --(DemucsBridge.toServer)--> file réseau --AUDIO--> demucs_server.py
+thread audio <-(DemucsBridge.fromServer)- file réseau <-RESULT-- (traité + sec aligné)
+```
+
+- **Protocole v2** (`DemucsProtocol.swift`, `ML/demucs_server.py`) : en-tête de 12 octets `magic "BHMD" | type | valeur`, suivi des données. Messages : `HELLO` (fréquence d'échantillonnage), `HELLO_ACK` (version), `AUDIO`, `RESULT`. `RESULT` contient `[wetL, wetR, dryL, dryR]` : le signal sec est aligné avec le signal traité, et le mélange selon l'intensité ne produit donc pas d'écho.
+- **Serveur** : il sépare `[1 s de contexte | 1,5 s de nouveau signal]`, émet 1,5 s et applique un fondu enchaîné de 0,2 s entre deux blocs. Il rééchantillonne vers la fréquence du modèle et en revient. Il accumule les entrées dans des tableaux numpy et coupe si le retard dépasse 10 s.
+- **Latence** : environ 3,7 s mesurées (1,5 s de bloc + 0,2 s de fondu + calcul + 0,75 s de marge contre la gigue).
+- **Cycle de vie** : le serveur est lancé seulement quand « Demucs AI » est activé, puis arrêté à la désactivation ou à la fermeture de l'app. Avec `--parent-pid`, il s'arrête aussi tout seul si l'app plante.
+- **Interpréteur** : premier `python3` capable d'importer `demucs`, `torch` et `torchaudio` (Homebrew, `/usr/local`, python.org, système). On peut le forcer : `defaults write com.blackhole.monitor demucsPythonPath /chemin/python3`.
+- **Sécurité** : la vérification TLS reste active ; les certificats de `certifi` sont utilisés s'il est installé.
+- Tant que le flux IA n'est pas prêt, ou en cas d'échec, le Mid-Side est utilisé et l'UI affiche le statut.
+
+## Système de visualisation
+
+- Le thread audio calcule le spectre et l'oscilloscope **à partir du nombre d'échantillons**, quelle que soit la taille des buffers, puis les dépose dans `VisualizationTap` (`trylock`).
+- Une minuterie du thread principal (60 Hz) les copie dans `VisualizationData`. Elle ne tourne que si une visualisation est visible **et** que l'audio est démarré.
+- Les vues observent seulement `VisualizationData`. `DiscoView` n'observe plus `AudioManager`.
+
+### Gestion du drapeau `visualizationActive`
+
+| Événement | Action |
 |---|---|
-| Demarrage app | `visualizationActive = false` |
-| Ouverture popover | `= true` |
-| Fermeture popover | `= false` (si ni spectrum ni disco actifs) |
-| Ouverture spectrum flottant | `= true` |
-| Fermeture spectrum flottant | `= false` (si disco inactif) |
-| Ouverture disco | `= true` |
-| Fermeture disco | `= false` (si spectrum inactif) |
+| Démarrage de l'app | `visualizationActive = false` |
+| Ouverture du popover | `= true` |
+| Fermeture du popover | `= false` (si ni le spectre ni le disco ne sont actifs) |
+| Ouverture du spectre flottant | `= true` |
+| Fermeture du spectre flottant | `= false` (si le disco est inactif) |
+| Ouverture du disco | `= true` |
+| Fermeture du disco | `= false` (si le spectre est inactif) |
+
+## Tests
+
+```bash
+swift test                      # 41 tests XCTest du dossier DSP/
+swift test --sanitize=thread    # mêmes tests sous Thread Sanitizer
+```
+
+Les tests portent directement sur le code de production : continuité de phase et débit du rééchantillonneur, convergence de la correction de dérive en boucle fermée, amorçage et latence adaptative du ring buffer, absence de lectures déchirées dans `ParameterMailbox`, protocole Demucs, etc.
+
+## Journaux
+
+```bash
+log stream --level info --predicate 'subsystem == "com.blackhole.monitor"'
+```
+
+Catégories : `app`, `audio`, `demucs` (y compris la sortie du serveur Python).
 
 ## Optimisations de performance
 
 ### Historique des optimisations CPU
 
-Le projet est passe de **182% CPU** a **0.0% au repos** a travers plusieurs iterations :
+Le projet est passé de **182 % CPU** à **0,0 % au repos** en plusieurs étapes :
 
-1. **Throttling UI** (`5635e37`) : limitation des mises a jour UI a 20fps pour le spectre, 60fps pour l'oscilloscope
-2. **Isolation re-renders** (`077b71d`) : `VisualizationData` separe pour eviter de re-render `MenuBarView` a chaque frame
-3. **Skip FFT quand invisible** (`1d5142f`) : guard `visualizationActive` dans `analyzeSpectrum()` et `updateOscilloscope()`
-4. **Desactivation complete au repos** (`8ec583b`) :
-   - `visualizationActive` demarre a `false` au lieu de `true`
-   - Timer disco 60fps controle par `onAppear`/`onDisappear` au lieu de `autoconnect()`
-   - Fermeture disco/spectrum desactive correctement la visualisation
-   - `popoverDidClose` verifie disco ET spectrum avant de couper
-
-### Resultat
-
-- **Au repos (aucun son)** : 0.0% CPU
-- **Musique en lecture (pas de visualisation ouverte)** : 0.0% CPU (seul le pipeline audio tourne, cout negligeable)
-- **Avec visualisation ouverte** : FFT + oscilloscope actifs, throttles a 20/60fps
+1. **Limitation de l'UI** (`5635e37`) : 20 i/s pour le spectre, 60 i/s pour l'oscilloscope
+2. **Isolation des re-rendus** (`077b71d`) : `VisualizationData` séparé
+3. **FFT ignorée quand rien n'est visible** (`1d5142f`)
+4. **Désactivation complète au repos** (`8ec583b`)
+5. **Callbacks sans allocation** : FFT calculée 20 fois par seconde (et non plus à chaque callback), serveur Demucs lancé seulement à la demande (il démarrait avant à chaque lancement de l'app)
 
 ### Note sur le sample rate
 
-Le daemon `coreaudiod (usbaudiod)` peut consommer excessivement le CPU (>12%) si le sample rate de la sortie USB ne correspond pas au natif du peripherique. Configurer la sortie en 44.1kHz natif resout le probleme (0.0% CPU).
+Le démon `coreaudiod (usbaudiod)` peut consommer beaucoup de CPU (> 12 %) si la fréquence de la sortie USB ne correspond pas à sa fréquence native. Régler la sortie sur sa fréquence native (par exemple 44,1 kHz) règle le problème (0,0 % CPU).
