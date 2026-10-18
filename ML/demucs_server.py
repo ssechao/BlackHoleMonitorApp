@@ -12,7 +12,11 @@ starts with a 12-byte little-endian header: magic "BHMD", type, value.
 
 Streaming: each step separates [CONTEXT_S of previous input | HOP_S of new input]
 and emits HOP_S of output, cross-fading XFADE_S at chunk boundaries.
-Latency is about HOP_S + XFADE_S + processing time.
+Latency is about HOP_S + XFADE_S + processing time (+ the app's jitter margin).
+
+HTDemucs pads every input to its training segment (~7.8 s), so the cost of a
+step barely depends on its length: a short hop lowers latency without
+increasing the work per step, as long as a step runs faster than HOP_S.
 
 Usage: demucs_server.py [--port 19845] [--parent-pid PID]
 """
@@ -55,9 +59,9 @@ MSG_HELLO, MSG_HELLO_ACK, MSG_AUDIO, MSG_RESULT = 1, 2, 3, 4
 MAX_FRAMES_PER_MESSAGE = 2_000_000
 
 CHANNELS = 2
-CONTEXT_S = 1.0     # left context given to the model (not emitted)
-HOP_S = 1.5         # new audio emitted per step
-XFADE_S = 0.2       # cross-fade between consecutive steps (<= CONTEXT_S)
+CONTEXT_S = 1.5     # left context given to the model (not emitted)
+HOP_S = 0.75        # new audio emitted per step
+XFADE_S = 0.1       # cross-fade between consecutive steps (<= CONTEXT_S)
 MAX_BACKLOG_S = 10.0  # drop oldest input if processing falls behind
 
 
@@ -97,10 +101,20 @@ class Separator:
                 model.eval()
                 self.model = model
                 log(f"Model {name} loaded")
+                self.warm_up()
                 return True
             except Exception as error:  # noqa: BLE001 - try the next model
                 log(f"Failed to load {name}: {error}")
         return False
+
+    def warm_up(self):
+        """The first inference compiles/caches the MPS kernels (~1 s extra).
+        Do it now, so the first real step is as fast as the others."""
+        started = time.time()
+        window = int((CONTEXT_S + HOP_S) * self.model.samplerate)
+        for _ in range(2):
+            self.separate(np.zeros((window, CHANNELS), np.float32), self.model.samplerate)
+        log(f"Warm-up done in {time.time() - started:.2f}s")
 
     def separate(self, audio, sample_rate):
         """audio: (frames, 2) float32 at sample_rate -> instrumental (frames, 2)."""
@@ -110,7 +124,8 @@ class Separator:
         if sample_rate != model_rate:
             waveform = AF.resample(waveform, sample_rate, model_rate)
         with torch.no_grad():
-            sources = apply_model(self.model, waveform.to(self.device), device=self.device)
+            # shifts=0: no random time shift (deterministic, less padding work)
+            sources = apply_model(self.model, waveform.to(self.device), device=self.device, shifts=0)
         vocals = self.model.sources.index("vocals")
         instrumental = sources[0].sum(dim=0) - sources[0, vocals]
         instrumental = instrumental.unsqueeze(0).cpu()
@@ -132,6 +147,7 @@ class Stream:
         self.hop = int(HOP_S * sample_rate)
         self.xfade = min(int(XFADE_S * sample_rate), self.context)
         self.max_backlog = int(MAX_BACKLOG_S * sample_rate)
+        self.warmed_up = False
         self.pending = []           # list of (n, 2) arrays not yet processed
         self.pending_frames = 0
         self.history = np.zeros((self.context, CHANNELS), np.float32)
@@ -192,6 +208,7 @@ class Connection:
                     with self.lock:
                         self.stream = Stream(int(value))
                         send_message(self.conn, MSG_HELLO_ACK, PROTOCOL_VERSION)
+                        self.lock.notify()  # let the worker warm up for this rate
                     log(f"Stream configured at {value} Hz")
                 elif msg_type == MSG_AUDIO:
                     if value > MAX_FRAMES_PER_MESSAGE:
@@ -217,12 +234,23 @@ class Connection:
     def process_loop(self):
         while True:
             with self.lock:
-                while not self.closed and (self.stream is None or self.stream.pending_frames < self.stream.hop):
+                while not self.closed and (self.stream is None or
+                                           (self.stream.warmed_up and self.stream.pending_frames < self.stream.hop)):
                     self.lock.wait()
                 if self.closed:
                     return
                 stream = self.stream
-                hop = stream.take_hop()
+                hop = stream.take_hop() if stream.warmed_up else None
+            if hop is None:
+                # Warm up resampling at this stream's rate while the first hop is filling
+                started = time.time()
+                try:
+                    self.separator.separate(np.zeros((stream.context + stream.hop, CHANNELS), np.float32), stream.sample_rate)
+                except Exception as error:  # noqa: BLE001
+                    log(f"Warm-up error: {error}")
+                stream.warmed_up = True
+                log(f"Stream warm-up at {stream.sample_rate} Hz in {time.time() - started:.2f}s")
+                continue
             started = time.time()
             try:
                 result = stream.step(self.separator, hop)
@@ -237,7 +265,7 @@ class Connection:
                     send_message(self.conn, MSG_RESULT, result.shape[0], payload)
                 except OSError:
                     return
-            log(f"Processed {HOP_S:.1f}s in {time.time() - started:.2f}s")
+            log(f"Processed {HOP_S:.2f}s in {time.time() - started:.2f}s")
 
 
 def watch_parent(parent_pid):

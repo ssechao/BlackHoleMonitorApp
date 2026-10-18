@@ -205,7 +205,7 @@ struct MenuBarView: View {
                                 if audioManager.karaokeUseAI {
                                     switch audioManager.karaokeAIStatus {
                                     case .ready:
-                                        Text("(~4s latency)")
+                                        Text("(~1.7s latency)")
                                             .font(.caption2)
                                             .foregroundColor(.orange)
                                     case .starting:

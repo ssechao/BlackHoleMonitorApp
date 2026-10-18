@@ -10,7 +10,7 @@ import Foundation
 final class DemucsBridge {
     static let maxBlockFrames = 4096
     /// Silence inserted before the stream (re)starts, absorbs server jitter.
-    static let leadInSeconds = 0.75
+    static let leadInSeconds = 0.4
 
     let sampleRate: Double
     /// Audio thread -> network: interleaved stereo input.
