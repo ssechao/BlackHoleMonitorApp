@@ -70,7 +70,7 @@ Les FIFO (`RingBuffer`) sont préallouées et protégées par `os_unfair_lock`. 
 1. **Capture** : le callback d'entrée appelle `AudioUnitRender` avec l'horodatage et les drapeaux reçus. Il utilise une `AudioBufferList` préallouée : un tampon si le format est entrelacé, un tampon par canal sinon.
 2. **Désentrelacement** si besoin (`vDSP_ztoc`).
 3. **Rééchantillonnage** (si les fréquences diffèrent) avec le ratio corrigé par `DriftController`. La position de lecture est suivie en continu : le débit moyen est exact, sans saut de phase.
-4. **Ring buffer** : cible de 30 ms. Après une sous-alimentation, la cible augmente de 10 ms, jusqu'à 150 ms au maximum.
+4. **Ring buffer** : cible de 10 ms (un bloc HAL typique). La cible ne grandit pas après une sous-alimentation, pour rester dans la fenêtre d'annulation d'écho des outils de visio. Un filet d'urgence vide 64 trames si le FIFO dépasse 2× la cible.
 5. **Karaoké** : Mid-Side (fréquence de sortie) ou flux Demucs retardé.
 6. **Compresseur**, **égaliseur**, **visualisation** (seulement si une vue est ouverte), **volume** (courbe x³).
 7. **Sortie** : copie vers les tampons de l'AUHAL, entrelacés ou non (`vDSP_ctoz`).
@@ -82,8 +82,8 @@ Le traitement se fait par blocs de 4096 frames au plus. `kAudioUnitProperty_Maxi
 Avant, chaque callback allouait plusieurs tableaux et envoyait des blocs sur la file principale. Sous charge, cela provoquait de courtes coupures en rafale : des craquements. Désormais :
 
 - les callbacks n'allouent rien et ne prennent jamais de verrou bloquant pour lire les paramètres ;
-- après une sous-alimentation, le `RingBuffer` reste silencieux (avec fondu) jusqu'à retrouver sa cible. On obtient **une seule coupure nette** au lieu d'une rafale de micro-coupures ;
-- la cible de latence augmente automatiquement pour absorber la charge. Le nombre de sous-alimentations et la latence finale sont journalisés à l'arrêt.
+- après une sous-alimentation, le `RingBuffer` reste silencieux (avec fondu) jusqu'à retrouver sa cible de 10 ms. On obtient **une seule coupure nette** au lieu d'une rafale de micro-coupures ;
+- le nombre de sous-alimentations et la latence finale sont journalisés à l'arrêt.
 
 ## Karaoké IA (Demucs)
 

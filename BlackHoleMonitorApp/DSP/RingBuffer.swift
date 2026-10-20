@@ -11,8 +11,9 @@ import os.lock
 /// - **Priming**: after start or after an underrun, output stays silent until
 ///   `targetFrames` are buffered. Under CPU overload this produces one clean gap
 ///   instead of a burst of tiny dropouts (crackles).
-/// - **Adaptive latency**: each underrun (after the first priming) raises the
-///   target by `latencyStepFrames`, up to `maxTargetFrames`.
+/// - **Adaptive latency**: if `latencyStepFrames` > 0, each underrun (after the
+///   first priming) raises the target by that amount, up to `maxTargetFrames`.
+///   The audio session uses a step of 0 so visio echo cancellation keeps a short delay.
 /// - **Fades**: short fade-out on underrun and fade-in on resume, to avoid clicks.
 final class RingBuffer {
     static let fadeFrames = 64
@@ -66,8 +67,8 @@ final class RingBuffer {
     /// Underruns that happened after playback had started.
     var underrunCount: Int { withLock { underruns } }
 
-    /// When enabled, a buffer more than 5x over target is drained 64 frames per write
-    /// (last-resort drift handling; the drift controller normally prevents this).
+    /// When enabled, a buffer more than 2× the target is drained 64 frames per write
+    /// (last-resort drift handling when input and output clocks diverge).
     func setEmergencyDropEnabled(_ enabled: Bool) {
         withLock { emergencyDropEnabled = enabled }
     }
@@ -91,7 +92,7 @@ final class RingBuffer {
         os_unfair_lock_lock(lock)
         defer { os_unfair_lock_unlock(lock) }
 
-        if emergencyDropEnabled && target > 0 && available > target * 5 {
+        if emergencyDropEnabled && target > 0 && available > target * 2 {
             skip(min(64, available - target))
         }
 

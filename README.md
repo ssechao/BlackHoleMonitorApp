@@ -71,7 +71,7 @@ Audio Source → BlackHole → BlackHoleMonitorApp → Output Device
 
 1. **Input**: Capture from BlackHole via AUHAL (interleaved or planar)
 2. **Resampling**: Streaming Catmull-Rom resampler with drift correction (if rates differ)
-3. **Ring buffer**: 30 ms target, grows automatically after underruns (CPU overload)
+3. **Ring buffer**: 10 ms target (one HAL buffer), no growth after underruns
 4. **Karaoke**: Mid-Side processing or Demucs AI (~1.7 s latency)
 5. **Compression**: Block-based peak compressor
 6. **EQ**: 8 biquad peak filters

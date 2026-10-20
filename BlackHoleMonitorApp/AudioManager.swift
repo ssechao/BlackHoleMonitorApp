@@ -112,11 +112,7 @@ final class AudioManager: ObservableObject {
 
     // Drift correction via resampling (when input and output rates differ)
     @Published var driftCorrectionEnabled: Bool = true {
-        didSet {
-            session?.setDriftCorrectionEnabled(driftCorrectionEnabled)
-            pushRenderParameters()
-            scheduleSave()
-        }
+        didSet { pushRenderParameters(); scheduleSave() }
     }
 
     // Karaoke mode
@@ -260,7 +256,6 @@ final class AudioManager: ObservableObject {
                 visualizationTap: visualizationTap
             )
             session = newSession
-            newSession.setDriftCorrectionEnabled(driftCorrectionEnabled)
             pushEqualizer()
             pushCompressor()
             pushRenderParameters()

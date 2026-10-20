@@ -82,6 +82,17 @@ final class RingBufferTests: XCTestCase {
         XCTAssertEqual(out[RingBuffer.fadeFrames], 1)
     }
 
+    func testUnderrunKeepsTargetWhenStepIsZero() {
+        let buffer = RingBuffer(capacityFrames: 10_000, channels: 1, targetFrames: 100,
+                                maxTargetFrames: 150, latencyStepFrames: 0)
+        let ones = [Float](repeating: 1, count: 200)
+        ones.withUnsafeBufferPointer { buffer.write($0.baseAddress!, frames: 200) }
+        var out = [Float](repeating: 0, count: 400)
+        _ = out.withUnsafeMutableBufferPointer { buffer.read($0.baseAddress!, frames: 400) }
+        XCTAssertEqual(buffer.underrunCount, 1)
+        XCTAssertEqual(buffer.targetFrames, 100)
+    }
+
     func testEmergencyDropOnlyWhenEnabled() {
         let buffer = RingBuffer(capacityFrames: 10_000, channels: 1, targetFrames: 100)
         let data = [Float](repeating: 1, count: 600)

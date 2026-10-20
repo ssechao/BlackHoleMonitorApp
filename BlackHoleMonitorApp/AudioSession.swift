@@ -24,9 +24,11 @@ struct RenderParameters {
 /// state the audio threads read.
 final class AudioSession {
     static let preferredMaxFrames: UInt32 = 4096
-    static let targetLatencyMs = 30.0
-    static let maxLatencyMs = 150.0
-    static let latencyStepMs = 10.0
+    /// One typical HAL buffer (512 frames at 48 kHz). Kept small so visio AEC
+    /// still sees its own playback in the microphone.
+    static let targetLatencyMs = 10.0
+    static let maxLatencyMs = 10.0
+    static let latencyStepMs = 0.0
 
     let channels: Int
     let inputSampleRate: Double
@@ -95,6 +97,10 @@ final class AudioSession {
             maxTargetFrames: Int(Self.maxLatencyMs * framesPerMs),
             latencyStepFrames: Int(Self.latencyStepMs * framesPerMs)
         )
+        // Always on: the FIFO must stay near the target even when the
+        // resampler (and the drift-correction toggle) is off, otherwise clock
+        // drift between BlackHole and a USB device fills the buffer for minutes.
+        ringBuffer.setEmergencyDropEnabled(true)
         // Same nominal rate: no resampling (drift is then handled by the
         // ring buffer's emergency drop and priming).
         if inputSampleRate != outputSampleRate {
@@ -164,11 +170,7 @@ final class AudioSession {
         }
     }
 
-    func setDriftCorrectionEnabled(_ enabled: Bool) {
-        ringBuffer.setEmergencyDropEnabled(enabled)
-    }
-
-    /// Current playback buffer target (grows after underruns).
+    /// Current playback buffer target.
     var currentLatencyMs: Double {
         Double(ringBuffer.targetFrames) / outputSampleRate * 1000
     }
